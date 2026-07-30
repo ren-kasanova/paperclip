@@ -29,10 +29,12 @@ continuously.
      `QA REJECTED` comment, returns the same issue to `In Progress`, and wakes
      the single linked `[KSNV-###] Delivery QA-return monitor`.
    - `Ready for Release`: require the exact QA-approved artifact, TN10
-     evidence, rollout and rollback evidence; route required approvals to Ren;
-     promote through the existing authorized production release path; record
-     immutable deployment evidence; then advance to `Production Validation`.
-     A blocker or implementation change returns the issue to `In Progress`.
+     evidence, rollout and rollback evidence; promote through the existing
+     authorized production release path; record immutable deployment evidence;
+     then advance to `Production Validation`. Routine reviewed merges,
+     standing-policy scheduled releases, exact-artifact promotions, and
+     evidence-based Linear transitions require no per-run Ren confirmation. A
+     blocker or implementation change returns the issue to `In Progress`.
    - `Production Validation`: gather direct production evidence for every
      acceptance criterion plus health/regression evidence. PASS advances to
      `Done`; failure or remaining implementation work returns the issue to `In
@@ -54,12 +56,15 @@ continuously.
    accepted QA cycle, require one eligible delivery monitor assigned to
    Kasanova Delivery, with no user assignee, `in_progress` or `in_review`
    status, and a non-null `monitorNextCheckAt`.
-10. A production-promotion confirmation must bind the exact approved artifact
-    with a custom target key
+10. Create a production-promotion confirmation only for a freeze change,
+    emergency/manual/out-of-cadence release, policy exception, or materially
+    new irreversible production effect outside standing policy. Bind that
+    exceptional confirmation to the exact approved artifact with a custom key
     `KSNV-###:production-promotion:<exact-release-path>` and immutable
     `target.revisionId`. Re-read the live state, accepted interaction, digest,
-    release path, and rollback evidence immediately before promotion; any
-    drift requires a new confirmation.
+    release path, and rollback evidence immediately before promotion. Only real
+    target or effect drift requires a new confirmation; do not replace a
+    still-valid accepted confirmation for the same target and effect.
 
 ## Hard limits
 
@@ -89,6 +94,12 @@ continuously.
   provisioning, destructive, financial, security-sensitive, publication,
   merge, deployment, or production effect. An interaction cannot authorize a
   read, a device probe/use, or browser access.
+- The `0.5.0+160` freeze blocks store/OTA execution and version/build
+  advancement, not ordinary reviewed merges. After the freeze is explicitly
+  lifted, policy-compliant scheduled releases and exact-artifact promotions
+  are standing-authorized. Granting or changing credentials, secrets,
+  accounts, or security-sensitive access remains separately
+  approval-controlled.
 - Route every actually required approval or confirmation for a
   state-changing, destructive, financial, security-sensitive, publication,
   merge, deployment, or production operation to Ren through a first-class
@@ -98,6 +109,7 @@ continuously.
 - Do not merge, publish packages, submit transactions, move funds, modify
   source code, or mutate production outside the exact `Ready for Release`
   promotion assignment. Promotion is limited to the QA-approved artifact and
-  existing release path, with all required approvals routed to Ren.
+  existing release path. Policy-compliant promotion requires no Paperclip
+  confirmation; exceptional approvals defined above are routed to Ren.
 - Keep canonical checkouts clean. Any check that writes source or generated
   artifacts requires an explicitly assigned dedicated QA worktree.

@@ -50,18 +50,28 @@ You own QA for `/Volumes/OdessaExt/Kasanova`.
   or development deployment problem returns the ticket to `In Progress` with
   reproducible evidence.
 - In `Ready for Release`, own the production-promotion gate: require the exact
-  QA-approved artifact, release and rollback evidence, route every required
-  approval to Ren, promote through the existing authorized release path, and
-  record the immutable deployment identifier before moving to `Production
-  Validation`.
-- Bind every production-promotion confirmation to a Paperclip custom target:
+  QA-approved artifact, release and rollback evidence, promote through the
+  existing authorized release path, and record the immutable deployment
+  identifier before moving to `Production Validation`. A routine reviewed
+  merge, standing-policy scheduled release, exact-artifact promotion, or
+  evidence-based Linear transition requires no per-run Ren confirmation.
+- The release freeze is a store/build control whose current target is
+  `0.5.0+160`. It blocks store/OTA execution and version/build advancement; it
+  does not freeze `main`, block ordinary reviewed merges, or add a Ren approval
+  gate to QA-approved production merges.
+- Create a production-promotion confirmation only for a freeze change,
+  emergency/manual/out-of-cadence release, policy exception, or materially new
+  irreversible production effect outside standing policy. Bind that
+  exceptional confirmation to a Paperclip custom target:
   `target.key` is
   `KSNV-###:production-promotion:<exact-release-path>` and
   `target.revisionId` is the QA-approved immutable artifact digest or release
   revision. The details must name the artifact, digest, release path, and
   rollback evidence. Immediately before promotion, re-read the live Linear
   state and accepted interaction and prove every target field still matches.
-  Drift invalidates the acceptance and requires a new confirmation.
+  Only real target or effect drift invalidates the acceptance. Do not create a
+  replacement when a still-valid accepted confirmation covers the same target
+  and effect.
 - In `Production Validation`, gather direct production evidence for every
   acceptance criterion. PASS advances to `Done`; failure or additional
   implementation work returns the issue to `In Progress`.
@@ -124,6 +134,10 @@ You own QA for `/Volumes/OdessaExt/Kasanova`.
   `production`. No matching effect means the interaction is prohibited.
   Never create an interaction to authorize read-only work, Android-device
   use, or browser access.
+- A matching merge/deployment/production category does not override the
+  standing release authorization in `LINEAR_WORKFLOW.md` and `POLICY.md`.
+  Granting or changing credentials, secrets, accounts, or security-sensitive
+  access remains separately approval-controlled.
 - Route every actually required approval or confirmation for a
   state-changing, destructive, financial, security-sensitive, publication,
   merge, deployment, or production operation to Ren through a first-class
@@ -134,7 +148,8 @@ You own QA for `/Volumes/OdessaExt/Kasanova`.
 - Do not merge, publish packages, submit transactions, move funds, or mutate
   production outside the exact `Ready for Release` promotion assignment.
   Production promotion is limited to the QA-approved artifact and the existing
-  release path; all required approvals must reach Ren.
+  release path. Policy-compliant production promotion proceeds without a
+  Paperclip confirmation; exceptional approvals defined above must reach Ren.
 - Android-device authorization never extends to mainnet funds or unrelated
   account and production changes.
 - Treat security-relevant uncertainty as BLOCKED or FAIL with the evidence

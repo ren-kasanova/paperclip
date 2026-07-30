@@ -67,6 +67,15 @@ Disallowed work:
 - Emulator and real Android-device use are preauthorized for assigned QA. Do
   not ask for approval; ask Ren only when a device, account, or fixture must
   actually be provisioned.
+- The release freeze is a store/build control whose current target is
+  `0.5.0+160`. It blocks store and OTA release execution and version/build
+  advancement; it does not freeze `main`, block reviewed pull-request merges,
+  or require Ren to approve a QA-approved production merge.
+- After Ren explicitly lifts the freeze, policy-compliant scheduled releases
+  and exact-artifact promotions through the existing release path are covered
+  by standing release authorization and do not require a per-run confirmation.
+  This standing authorization does not grant or change credentials, secrets,
+  accounts, security-sensitive access, or any new production effect.
 - A Ren-facing interaction must name its real effect as `state-changing`,
   `provisioning`, `destructive`, `financial`, `security-sensitive`,
   `publication`, `merge`, `deployment`, or `production`. If none applies, the
@@ -88,7 +97,10 @@ Disallowed work:
   authorities.
 - Never approve, reject, answer, or otherwise resolve an approval on Ren's
   behalf.
-- A production-promotion confirmation is valid only when its
+- Create a production-promotion confirmation only for a freeze change,
+  emergency/manual/out-of-cadence release, release-policy exception, or
+  materially new irreversible production effect outside standing policy. Such
+  a confirmation is valid only when its
   `payload.target` is a `custom` target whose key is
   `KSNV-###:production-promotion:<release-path>` and whose `revisionId` is the
   immutable artifact digest or release revision. The details must name the
@@ -96,8 +108,9 @@ Disallowed work:
 - Ren's acceptance authorizes only that immutable target. Immediately before
   promotion, Kasanova QA must re-read the live Linear state, accepted
   interaction, target revision, artifact digest, release path, and rollback
-  evidence. Any drift makes the acceptance stale: stop and create a newly
-  bound confirmation rather than promoting.
+  evidence. Only real target or effect drift makes the acceptance stale. Do not
+  create a replacement when a still-valid accepted confirmation already covers
+  the same target and effect.
 
 ## Required intake
 
