@@ -131,6 +131,7 @@ import type { TaskWatchdogServiceDeps, taskWatchdogService } from "../services/t
 import { logger } from "../middleware/logger.js";
 import { conflict, forbidden, HttpError, notFound, unauthorized, unprocessable } from "../errors.js";
 import { assertBoard, assertCompanyAccess, getAccessibleResource, getActorInfo } from "./authz.js";
+import { authenticateDeck7Decision } from "./deck7-provenance.js";
 import {
   assertNoAgentHostWorkspaceCommandMutation,
   collectIssueWorkspaceCommandPaths,
@@ -9078,6 +9079,7 @@ export function issueRoutes(
       assertBoard(req);
 
       const actor = getActorInfo(req);
+      const decisionProvenance = authenticateDeck7Decision(req);
       const { interaction, createdIssues, continuationIssue } = await issueThreadInteractionService(db).acceptInteraction(issue, interactionId, req.body, {
         agentId: actor.agentId,
         userId: actor.actorType === "user" ? actor.actorId : null,
@@ -9147,6 +9149,7 @@ export function issueRoutes(
             interaction.kind === "suggest_tasks"
               ? (interaction.result?.skippedClientKeys?.length ?? 0)
               : 0,
+          decisionProvenance,
         },
       });
 

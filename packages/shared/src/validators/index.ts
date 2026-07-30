@@ -543,11 +543,13 @@ export {
 } from "./goal.js";
 
 export {
+  decisionProvenanceSchema,
   createApprovalSchema,
   resolveApprovalSchema,
   requestApprovalRevisionSchema,
   resubmitApprovalSchema,
   addApprovalCommentSchema,
+  type DecisionProvenance,
   type CreateApproval,
   type ResolveApproval,
   type RequestApprovalRevision,

@@ -6,6 +6,7 @@ import path from "node:path";
 
 export type LocalProcessSandboxAccess = "ro" | "rw";
 export type LocalProcessNetworkScope = "deny" | "allowlist";
+export type LocalProcessSandboxBackend = "bubblewrap" | "landlock";
 
 export interface LocalProcessSandboxPath {
   path: string;
@@ -20,6 +21,7 @@ export interface LocalProcessSandboxOptions {
   homeDir?: string | null;
   networkScope?: LocalProcessNetworkScope | null;
   networkAllowlist?: string[];
+  backend?: LocalProcessSandboxBackend;
   command?: string;
 }
 
@@ -56,6 +58,9 @@ const SYSTEM_READ_PATHS = [
   "/etc/localtime",
   "/etc/timezone",
   "/etc/gitconfig",
+  "/etc/profile",
+  "/etc/bash.bashrc",
+  "/etc/environment",
 ] as const;
 
 const PROXY_ENV_KEYS = ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"] as const;
@@ -148,6 +153,31 @@ export function parseLocalProcessFilesystemScope(value: unknown): "workspace" | 
   if (value == null || value === "") return null;
   if (value === "workspace") return value;
   throw new Error('filesystemScope must be "workspace".');
+}
+
+export function resolveLocalProcessRunScratchPath(
+  value: unknown,
+): LocalProcessSandboxPath[] {
+  if (value == null || value === "") return [];
+  if (typeof value !== "string") {
+    throw new Error("PAPERCLIP_RUN_SCRATCH_DIR must be an absolute path.");
+  }
+  return [
+    {
+      path: normalizeAbsolutePath(value, "PAPERCLIP_RUN_SCRATCH_DIR"),
+      access: "rw",
+    },
+  ];
+}
+
+export function parseLocalProcessSandboxBackend(
+  value: unknown,
+): LocalProcessSandboxBackend {
+  if (value == null || value === "") return "bubblewrap";
+  if (value === "bubblewrap" || value === "landlock") return value;
+  throw new Error(
+    'filesystemSandboxBackend must be "bubblewrap" or "landlock".',
+  );
 }
 
 function isNetworkTargetAllowed(hostname: string, port: string, rules: NetworkAllowlistRule[]): boolean {
@@ -264,7 +294,13 @@ export async function buildLocalProcessSandboxSpawnTarget(input: {
   }
   const filesystemScope = input.options.filesystemScope ?? null;
   const networkScope = input.options.networkScope ?? null;
+  const backend = input.options.backend ?? "bubblewrap";
   if (!filesystemScope && !networkScope) throw new Error("Local process sandbox requires a filesystem or network scope.");
+  if (backend === "landlock" && networkScope) {
+    throw new Error(
+      "The Landlock backend supports filesystemScope only; networkScope requires Bubblewrap.",
+    );
+  }
 
   const workspaceDir = normalizeAbsolutePath(input.options.workspaceDir, "Sandbox workspaceDir");
   const cwd = normalizeAbsolutePath(input.cwd, "Sandbox cwd");
@@ -273,6 +309,59 @@ export async function buildLocalProcessSandboxSpawnTarget(input: {
     if (relativeCwd.startsWith("..") || path.isAbsolute(relativeCwd)) {
       throw new Error(`Sandbox cwd "${cwd}" must be inside workspaceDir "${workspaceDir}".`);
     }
+  }
+
+  if (backend === "landlock") {
+    const command =
+      input.options.command?.trim() || "paperclip-landlock";
+    const tempDir = await fs.mkdtemp(
+      path.join(os.tmpdir(), "paperclip-landlock-"),
+    );
+    const pathAccess = new Map<string, LocalProcessSandboxAccess>();
+    const expose = async (
+      source: string,
+      access: LocalProcessSandboxAccess,
+    ) => {
+      const normalized = normalizeAbsolutePath(source, "Sandbox path");
+      if (!(await pathExists(normalized))) return;
+      if (pathAccess.get(normalized) === "rw") return;
+      pathAccess.set(normalized, access);
+    };
+    for (const systemPath of SYSTEM_READ_PATHS) {
+      await expose(systemPath, "ro");
+    }
+    await expose("/proc", "ro");
+    await expose("/dev", "rw");
+    for (const executablePath of await executableReadPaths(input.executable)) {
+      await expose(executablePath, "ro");
+    }
+    for (const managedPath of input.options.managedPaths ?? []) {
+      await expose(managedPath.path, managedPath.access);
+    }
+    for (const extraPath of input.options.extraPaths ?? []) {
+      await expose(extraPath.path, extraPath.access);
+    }
+    await expose(workspaceDir, "rw");
+    await expose(tempDir, "rw");
+
+    const args: string[] = [];
+    for (const [sandboxPath, access] of pathAccess) {
+      args.push(access === "rw" ? "--rw" : "--ro", sandboxPath);
+    }
+    args.push("--cwd", cwd, "--", input.executable, ...input.args);
+    return {
+      command,
+      args,
+      cwd: "/",
+      env: {
+        TMPDIR: tempDir,
+        TMP: tempDir,
+        TEMP: tempDir,
+      },
+      cleanup: async () => {
+        await fs.rm(tempDir, { recursive: true, force: true });
+      },
+    };
   }
 
   const bwrapCommand = input.options.command?.trim() || "bwrap";

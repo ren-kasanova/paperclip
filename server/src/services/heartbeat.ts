@@ -1630,6 +1630,7 @@ export async function assertGitSensitiveAdapterWorkspaceValid(input: {
         issueProjectId: issue.projectId,
         issueProjectWorkspaceId: issue.projectWorkspaceId,
         resolvedWorkspaceSource: input.resolvedWorkspace.source,
+        resolvedWorkspaceSourceType: input.resolvedWorkspace.sourceType,
         resolvedProjectId: input.resolvedWorkspace.projectId,
         resolvedProjectWorkspaceId: input.resolvedWorkspace.workspaceId,
         resolvedWorkspaceCwd: input.resolvedWorkspace.cwd,
@@ -1725,7 +1726,16 @@ export async function assertGitSensitiveAdapterWorkspaceValid(input: {
     );
   }
 
-  if (workspaceExpectation && effectiveCwd && !await hasGitMetadata(effectiveCwd)) {
+  const explicitlyNonGitProjectWorkspace =
+    input.resolvedWorkspace.source === "project_primary"
+    && input.resolvedWorkspace.sourceType === "non_git_path"
+    && input.executionWorkspace.strategy === "project_primary";
+  if (
+    workspaceExpectation
+    && effectiveCwd
+    && !explicitlyNonGitProjectWorkspace
+    && !await hasGitMetadata(effectiveCwd)
+  ) {
     fail(
       "missing_git_metadata",
       `Issue ${issue.identifier ?? issue.id} expected a git workspace for ${input.adapterType}, but "${effectiveCwd}" has no .git metadata.`,
@@ -2077,6 +2087,7 @@ export interface ModelProfileApplication {
 export type ResolvedWorkspaceForRun = {
   cwd: string;
   source: "project_primary" | "task_session" | "agent_home";
+  sourceType: string | null;
   projectId: string | null;
   workspaceId: string | null;
   repoUrl: string | null;
@@ -7336,6 +7347,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           return {
             cwd: projectCwd,
             source: "project_primary" as const,
+            sourceType: workspace.sourceType,
             projectId: resolvedProjectId,
             workspaceId: workspace.id,
             repoUrl: workspace.repoUrl,
@@ -7375,6 +7387,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       return {
         cwd: fallbackCwd,
         source: "project_primary" as const,
+        sourceType: projectWorkspaceRows[0]?.sourceType ?? null,
         projectId: resolvedProjectId,
         workspaceId: projectWorkspaceRows[0]?.id ?? null,
         repoUrl: projectWorkspaceRows[0]?.repoUrl ?? null,
@@ -7393,6 +7406,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       return {
         cwd: managedWorkspace.cwd,
         source: "project_primary" as const,
+        sourceType: null,
         projectId: resolvedProjectId,
         workspaceId: null,
         repoUrl: null,
@@ -7413,6 +7427,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         return {
           cwd: sessionCwd,
           source: "task_session" as const,
+          sourceType: null,
           projectId: resolvedProjectId,
           workspaceId: readNonEmptyString(previousSessionParams?.workspaceId),
           repoUrl: readNonEmptyString(previousSessionParams?.repoUrl),
@@ -7446,6 +7461,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return {
       cwd,
       source: "agent_home" as const,
+      sourceType: null,
       projectId: resolvedProjectId,
       workspaceId: null,
       repoUrl: null,
@@ -12926,6 +12942,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     context.paperclipWorkspace = {
       cwd: executionWorkspace.cwd,
       source: executionWorkspace.source,
+      sourceType: resolvedWorkspace.sourceType,
       mode: effectiveExecutionWorkspaceMode,
       strategy: executionWorkspace.strategy,
       projectId: executionWorkspace.projectId,

@@ -7,6 +7,12 @@ Guidance for human and AI contributors working in this repository.
 Paperclip is a control plane for AI-agent companies.
 The current implementation target is V1 and is defined in `doc/SPEC-implementation.md`.
 
+This OdessaExt checkout is also the canonical local deployment. Before any
+runtime, Compose, company, routine, agent, DECK·7, Android, port, persistence,
+or upgrade work, read `ODESSA.md`. Its local deployment rules override generic
+development-server examples in this file; keep port `3100` and the external
+named volumes.
+
 ## 2. Read This First
 
 Before making changes, read in this order:

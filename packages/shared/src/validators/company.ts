@@ -7,6 +7,13 @@ import {
 const logoAssetIdSchema = z.string().uuid().nullable().optional();
 const brandColorSchema = z.string().regex(/^#[0-9a-fA-F]{6}$/).nullable().optional();
 const feedbackDataSharingTermsVersionSchema = z.string().min(1).nullable().optional();
+const issuePrefixSchema = z
+  .string()
+  .trim()
+  .min(2)
+  .max(12)
+  .regex(/^[A-Za-z0-9]+$/, "Issue prefix must contain only letters and numbers")
+  .transform((value) => value.toUpperCase());
 const attachmentMaxBytesSchema = z
   .number()
   .int()
@@ -15,6 +22,7 @@ const attachmentMaxBytesSchema = z
 
 export const createCompanySchema = z.object({
   name: z.string().min(1),
+  issuePrefix: issuePrefixSchema.optional(),
   description: z.string().optional().nullable(),
   budgetMonthlyCents: z.number().int().nonnegative().optional().default(0),
   attachmentMaxBytes: attachmentMaxBytesSchema.optional(),
@@ -24,6 +32,7 @@ export const createCompanySchema = z.object({
 export type CreateCompany = z.infer<typeof createCompanySchema>;
 
 export const updateCompanySchema = createCompanySchema
+  .omit({ issuePrefix: true })
   .partial()
   .extend({
     status: z.enum(COMPANY_STATUSES).optional(),

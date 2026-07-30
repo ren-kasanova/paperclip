@@ -2,6 +2,16 @@ import { z } from "zod";
 import { APPROVAL_TYPES } from "../constants.js";
 import { multilineTextSchema } from "./text.js";
 
+export const decisionProvenanceSchema = z.object({
+  source: z.literal("deck7"),
+  promptId: z.string().trim().min(1).max(128),
+  choiceId: z.literal("approve"),
+  respondedAt: z.string().datetime({ offset: true }),
+  responseDigest: z.string().regex(/^[a-f0-9]{64}$/i),
+});
+
+export type DecisionProvenance = z.infer<typeof decisionProvenanceSchema>;
+
 export const createApprovalSchema = z.object({
   type: z.enum(APPROVAL_TYPES),
   requestedByAgentId: z.string().uuid().optional().nullable(),
@@ -13,6 +23,7 @@ export type CreateApproval = z.infer<typeof createApprovalSchema>;
 
 export const resolveApprovalSchema = z.object({
   decisionNote: multilineTextSchema.optional().nullable(),
+  decisionProvenance: decisionProvenanceSchema.optional(),
 });
 
 export type ResolveApproval = z.infer<typeof resolveApprovalSchema>;

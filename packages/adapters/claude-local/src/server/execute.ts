@@ -49,9 +49,11 @@ import {
 } from "@paperclipai/adapter-utils/server-utils";
 import {
   parseLocalProcessFilesystemScope,
+  parseLocalProcessSandboxBackend,
   parseLocalProcessSandboxExtraPaths,
   parseLocalProcessNetworkAllowlist,
   parseLocalProcessNetworkScope,
+  resolveLocalProcessRunScratchPath,
   type LocalProcessSandboxOptions,
 } from "@paperclipai/adapter-utils/local-process-sandbox";
 import {
@@ -527,6 +529,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const sharedClaudeConfigDir = resolveSharedClaudeConfigDir(process.env);
   const networkScope = parseLocalProcessNetworkScope(config.networkScope);
   const filesystemScope = parseLocalProcessFilesystemScope(config.filesystemScope);
+  const filesystemSandboxBackend = parseLocalProcessSandboxBackend(
+    config.filesystemSandboxBackend,
+  );
   const localProcessSandbox: LocalProcessSandboxOptions | null =
     (filesystemScope || networkScope) && !executionTargetIsRemote
       ? {
@@ -537,12 +542,21 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             { path: path.join(path.dirname(sharedClaudeConfigDir), ".claude.json"), access: "rw" },
             { path: promptBundle.addDir, access: "ro" },
             { path: localMcpConfigDir, access: "ro" },
+            ...resolveLocalProcessRunScratchPath(
+              env.PAPERCLIP_RUN_SCRATCH_DIR,
+            ),
           ],
           extraPaths: parseLocalProcessSandboxExtraPaths(config.filesystemExtraPaths),
           homeDir: filesystemScope ? path.dirname(sharedClaudeConfigDir) : null,
           networkScope,
           networkAllowlist: parseLocalProcessNetworkAllowlist(config.networkAllowlist),
-          command: asString(config.filesystemSandboxCommand, "bwrap"),
+          backend: filesystemSandboxBackend,
+          command: asString(
+            config.filesystemSandboxCommand,
+            filesystemSandboxBackend === "landlock"
+              ? "paperclip-landlock"
+              : "bwrap",
+          ),
         }
       : null;
   if (localProcessSandbox) {

@@ -6,9 +6,11 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   buildLocalProcessSandboxSpawnTarget,
   parseLocalProcessFilesystemScope,
+  parseLocalProcessSandboxBackend,
   parseLocalProcessNetworkAllowlist,
   parseLocalProcessNetworkScope,
   parseLocalProcessSandboxExtraPaths,
+  resolveLocalProcessRunScratchPath,
 } from "./local-process-sandbox.js";
 import { runChildProcess } from "./server-utils.js";
 
@@ -27,10 +29,25 @@ describe("local process sandbox", () => {
     expect(() => parseLocalProcessSandboxExtraPaths(["relative"])).toThrow("must be an absolute path");
   });
 
+  it("exposes only an absolute Paperclip-owned run scratch directory as writable", () => {
+    expect(resolveLocalProcessRunScratchPath("/tmp/paperclip-run-ksnvqa-53")).toEqual([
+      { path: "/tmp/paperclip-run-ksnvqa-53", access: "rw" },
+    ]);
+    expect(resolveLocalProcessRunScratchPath(undefined)).toEqual([]);
+    expect(() => resolveLocalProcessRunScratchPath("relative")).toThrow(
+      "must be an absolute path",
+    );
+  });
+
   it("parses network scopes and exact-host allowlists", () => {
     expect(parseLocalProcessFilesystemScope("workspace")).toBe("workspace");
     expect(parseLocalProcessFilesystemScope(undefined)).toBeNull();
     expect(() => parseLocalProcessFilesystemScope("workpace")).toThrow('filesystemScope must be "workspace"');
+    expect(parseLocalProcessSandboxBackend(undefined)).toBe("bubblewrap");
+    expect(parseLocalProcessSandboxBackend("landlock")).toBe("landlock");
+    expect(() => parseLocalProcessSandboxBackend("none")).toThrow(
+      '"bubblewrap" or "landlock"',
+    );
     expect(parseLocalProcessNetworkScope("deny")).toBe("deny");
     expect(parseLocalProcessNetworkScope("allowlist")).toBe("allowlist");
     expect(parseLocalProcessNetworkScope(undefined)).toBeNull();
@@ -38,6 +55,68 @@ describe("local process sandbox", () => {
       .toEqual(["api.openai.com", "api.anthropic.com", "gateway.test:8443"]);
     expect(() => parseLocalProcessNetworkAllowlist(["*.example.com"])).toThrow("exact hostname");
     expect(() => parseLocalProcessNetworkScope("public")).toThrow('"deny" or "allowlist"');
+  });
+
+  it("builds an unprivileged Landlock command with explicit path access", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-landlock-sandbox-"));
+    cleanup.push(root);
+    const workspace = path.join(root, "workspace");
+    const managedHome = path.join(root, "managed-home");
+    const readable = path.join(root, "readable.txt");
+    await fs.mkdir(workspace);
+    await fs.mkdir(managedHome);
+    await fs.writeFile(readable, "ok");
+
+    const target = await buildLocalProcessSandboxSpawnTarget({
+      executable: process.execPath,
+      args: ["-e", "console.log('ok')"],
+      cwd: workspace,
+      options: {
+        workspaceDir: workspace,
+        filesystemScope: "workspace",
+        backend: "landlock",
+        command: "/usr/local/bin/paperclip-landlock",
+        managedPaths: [{ path: managedHome, access: "rw" }],
+        extraPaths: [{ path: readable, access: "ro" }],
+      },
+    });
+
+    expect(target.command).toBe("/usr/local/bin/paperclip-landlock");
+    expect(target.args).toContain("--ro");
+    expect(target.args).toContain("--rw");
+    expect(target.args).toContain(workspace);
+    expect(target.args).toContain(managedHome);
+    expect(target.args).toContain(readable);
+    expect(target.args).toContain("/dev");
+    expect(target.args).toContain("/proc");
+    expect(target.args).toContain("/etc/profile");
+    expect(target.env?.TMPDIR).toMatch(
+      /paperclip-landlock-/,
+    );
+    expect(target.args.slice(-3)).toEqual([
+      process.execPath,
+      "-e",
+      "console.log('ok')",
+    ]);
+    await target.cleanup?.();
+  });
+
+  it("rejects network confinement with the Landlock backend", async () => {
+    const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-landlock-network-"));
+    cleanup.push(workspace);
+    await expect(
+      buildLocalProcessSandboxSpawnTarget({
+        executable: process.execPath,
+        args: ["-e", "process.exit(0)"],
+        cwd: workspace,
+        options: {
+          workspaceDir: workspace,
+          filesystemScope: "workspace",
+          networkScope: "deny",
+          backend: "landlock",
+        },
+      }),
+    ).rejects.toThrow("supports filesystemScope only");
   });
 
   it("builds a fresh-root bubblewrap command with workspace access", async () => {
@@ -145,7 +224,7 @@ describe("local process sandbox", () => {
           command: path.join(workspace, "missing-bwrap"),
         },
       }),
-    ).rejects.toThrow("requires Bubblewrap");
+    ).rejects.toThrow("requires the bubblewrap backend");
   });
 
   it.runIf(Boolean(process.env.PAPERCLIP_TEST_BWRAP))(

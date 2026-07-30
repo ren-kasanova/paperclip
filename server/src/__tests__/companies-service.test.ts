@@ -81,6 +81,32 @@ describeEmbeddedPostgres("companyService", () => {
     expect(rows.map((row) => row.issuePrefix).sort()).toEqual(["ARO", "AROA"]);
   });
 
+  it("preserves an explicit multi-letter issue prefix", async () => {
+    const created = await companyService(db).create({
+      name: "Kasanova QA",
+      issuePrefix: "KSNVQA",
+    });
+
+    expect(created.issuePrefix).toBe("KSNVQA");
+  });
+
+  it("rejects a conflicting explicit issue prefix", async () => {
+    await companyService(db).create({
+      name: "Clivi QA",
+      issuePrefix: "CLVQA",
+    });
+
+    await expect(
+      companyService(db).create({
+        name: "Another Clivi QA",
+        issuePrefix: "CLVQA",
+      }),
+    ).rejects.toMatchObject({
+      status: 409,
+      message: 'Issue prefix "CLVQA" is already in use',
+    });
+  });
+
   it("auto-provisions one paused Reflection Coach bundle for a freshly created company", async () => {
     const created = await companyService(db).create({
       name: "Fresh Company",

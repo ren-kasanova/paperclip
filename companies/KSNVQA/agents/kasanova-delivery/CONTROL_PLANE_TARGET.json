@@ -1,0 +1,40 @@
+{
+  "schema": "ksnvqa.delivery-control-plane-target.v1",
+  "generatedAt": "2026-07-30T05:30:00Z",
+  "authority": {
+    "system": "Paperclip local control plane",
+    "companyId": "0590afb4-7120-45c8-9109-62ad5098bb5f",
+    "companyName": "Kasanova QA",
+    "issuePrefix": "KSNVQA"
+  },
+  "agent": {
+    "id": "e6f72275-d3c5-4caf-baa5-d01adca1568d",
+    "name": "Kasanova Delivery"
+  },
+  "qaAgent": {
+    "id": "c4917415-0eb2-4122-9adb-4868343c9850",
+    "name": "Kasanova QA"
+  },
+  "project": {
+    "id": "07f395d6-b361-4331-b326-adad957aaf1d",
+    "name": "Kasanova Quality"
+  },
+  "projectWorkspace": {
+    "id": "4f5e4412-0d9b-46a9-8c0e-80d3196877e3",
+    "cwd": "/Volumes/OdessaExt/Kasanova"
+  },
+  "instructions": {
+    "path": "/Volumes/OdessaExt/Paperclip/companies/KSNVQA/agents/kasanova-delivery/AGENTS.md",
+    "policyPath": "/Volumes/OdessaExt/Paperclip/companies/KSNVQA/POLICY.md",
+    "linearWorkflowPath": "/Volumes/OdessaExt/Kasanova/LINEAR_WORKFLOW.md",
+    "qaHandoffSkillPath": "/Volumes/OdessaExt/Kasanova/.agents/skills/qa-handoff-loop/SKILL.md"
+  },
+  "bootstrapMonitor": {
+    "issueId": "bb06e2d0-a055-4634-be42-1aac493f3895",
+    "identifier": "KSNVQA-35",
+    "title": "[KSNV-161] dApp browser: implement signPsbt/signPsbts bridge handler (PSKT signing with sighash flags) — Delivery QA-return monitor",
+    "linearIdentifier": "KSNV-161",
+    "canonicalQaIssueId": "3152adac-4d79-4c25-bbb3-2196a18dc051",
+    "canonicalQaIdentifier": "KSNVQA-45"
+  }
+}

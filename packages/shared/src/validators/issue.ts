@@ -31,6 +31,7 @@ import {
   REQUEST_ITEM_VERDICTS_ITEM_LIMIT,
 } from "../constants.js";
 import { multilineTextSchema } from "./text.js";
+import { decisionProvenanceSchema } from "./approval.js";
 import { lowTrustReviewPresetPolicySchema, trustAuthorizationPolicySchema } from "./trust-policy.js";
 
 export const issueBlockedInboxStateSchema = z.enum([
@@ -914,6 +915,7 @@ export const requestConfirmationResultSchema = z.object({
   staleTarget: requestConfirmationTargetSchema.nullable().optional(),
   resumeFailure: requestConfirmationResumeFailureSchema.nullable().optional(),
   toolAction: requestConfirmationToolActionResultSchema.optional(),
+  decisionProvenance: decisionProvenanceSchema.optional(),
 });
 
 export const requestCheckboxConfirmationResultSchema = requestConfirmationResultSchema.extend({
@@ -1110,6 +1112,7 @@ export const acceptIssueThreadInteractionSchema = z.object({
   selectedOptionIds: z.array(z.string().trim().min(1).max(120))
     .max(REQUEST_CHECKBOX_CONFIRMATION_OPTION_LIMIT)
     .optional(),
+  decisionProvenance: decisionProvenanceSchema.optional(),
 }).superRefine((value, ctx) => {
   const seenClientKeys = new Set<string>();
   for (const [index, clientKey] of (value.selectedClientKeys ?? []).entries()) {

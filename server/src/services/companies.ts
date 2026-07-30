@@ -33,7 +33,7 @@ import {
   routineRevisions,
   routines,
 } from "@paperclipai/db";
-import { notFound, unprocessable } from "../errors.js";
+import { conflict, notFound, unprocessable } from "../errors.js";
 import { environmentService } from "./environments.js";
 import { heartbeatService } from "./heartbeat.js";
 import { logActivity } from "./activity-log.js";
@@ -232,6 +232,21 @@ export function companyService(db: Db) {
   }
 
   async function createCompanyWithUniquePrefix(data: typeof companies.$inferInsert) {
+    if (data.issuePrefix) {
+      try {
+        const rows = await db
+          .insert(companies)
+          .values({ ...data, issuePrefix: data.issuePrefix })
+          .returning();
+        return rows[0];
+      } catch (error) {
+        if (isIssuePrefixConflict(error)) {
+          throw conflict(`Issue prefix "${data.issuePrefix}" is already in use`);
+        }
+        throw error;
+      }
+    }
+
     const base = deriveIssuePrefixBase(data.name);
     let suffix = 1;
     while (suffix < 10000) {

@@ -353,6 +353,20 @@ describe("issue thread interaction schemas", () => {
     })).toThrow("selectedOptionIds must be unique");
   });
 
+  it("accepts authenticated DECK7 provenance for confirmations", () => {
+    const decisionProvenance = {
+      source: "deck7",
+      promptId: "pc.ksnvqa.confirm.1",
+      choiceId: "approve",
+      respondedAt: "2026-07-30T05:30:00.000Z",
+      responseDigest: "b".repeat(64),
+    } as const;
+
+    expect(
+      acceptIssueThreadInteractionSchema.parse({ decisionProvenance }),
+    ).toEqual({ decisionProvenance });
+  });
+
   it("parses request_item_verdicts payloads with defaults", () => {
     const parsed = createIssueThreadInteractionSchema.parse({
       kind: "request_item_verdicts",

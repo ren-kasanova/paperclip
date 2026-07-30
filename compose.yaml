@@ -1,0 +1,70 @@
+name: paperclip-odessa
+
+services:
+  paperclip:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        USER_UID: "501"
+        USER_GID: "20"
+    container_name: paperclip
+    restart: unless-stopped
+    command:
+      - "/bin/sh"
+      - "/opt/paperclip-watcher/paperclip-odessa-run.sh"
+    ports:
+      - "127.0.0.1:3100:3100"
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "3101"
+      SERVE_UI: "true"
+      PAPERCLIP_HOME: "/paperclip"
+      PAPERCLIP_INSTANCE_ID: "default"
+      PAPERCLIP_CONFIG: "/paperclip/instances/default/config.json"
+      PAPERCLIP_DEPLOYMENT_MODE: "local_trusted"
+      PAPERCLIP_DEPLOYMENT_EXPOSURE: "private"
+      PAPERCLIP_PUBLIC_URL: "http://localhost:3100"
+      PAPERCLIP_DECK7_ROUTER_TOKEN_FILE: "/run/paperclip-deck7-router/auth-token"
+    volumes:
+      - "paperclip-data:/paperclip"
+      - "paperclip-clivi-codex:/paperclip-codex/clivi"
+      - "paperclip-kasanova-qa-codex:/paperclip-codex/kasanova-qa"
+      - "paperclip-kasanova-delivery-codex:/paperclip-codex/kasanova-delivery"
+      - "./docker:/opt/paperclip-watcher:ro"
+      - "/Volumes/OdessaExt:/odessa-root:ro"
+      - "paperclip-deck7-router:/run/paperclip-deck7-router:ro"
+      - "/Volumes/OdessaExt/Paperclip/companies:/Volumes/OdessaExt/Paperclip/companies:ro"
+      - "/Volumes/OdessaExt/Clivi:/Volumes/OdessaExt/Clivi:ro"
+      - "/Volumes/OdessaExt/Kasanova:/Volumes/OdessaExt/Kasanova"
+      - "paperclip-kasanova-flutter-cache:/Volumes/OdessaExt/Kasanova/.worktrees/.toolchains/flutter/bin/cache"
+      - "paperclip-kasanova-dart-sdk:/Volumes/OdessaExt/Kasanova/.worktrees/.toolchains/flutter/bin/cache/dart-sdk"
+    healthcheck:
+      test: ["CMD", "/bin/sh", "/opt/paperclip-watcher/paperclip-healthcheck.sh"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+volumes:
+  paperclip-data:
+    name: paperclip_odessa_data
+    external: true
+  paperclip-clivi-codex:
+    name: paperclip_odessa_clivi_codex
+    external: true
+  paperclip-kasanova-qa-codex:
+    name: paperclip_odessa_kasanova_qa_codex
+    external: true
+  paperclip-kasanova-delivery-codex:
+    name: paperclip_odessa_kasanova_delivery_codex
+    external: true
+  paperclip-deck7-router:
+    name: paperclip_odessa_deck7_router
+    external: true
+  paperclip-kasanova-dart-sdk:
+    name: paperclip_odessa_kasanova_dart_sdk
+    external: true
+  paperclip-kasanova-flutter-cache:
+    name: paperclip_odessa_kasanova_flutter_cache
+    external: true

@@ -959,6 +959,9 @@ export function issueThreadInteractionService(db: Db) {
             version: 1,
             outcome: "accepted",
             ...(selectedOptionIds ? { selectedOptionIds } : {}),
+            ...(args.input.decisionProvenance
+              ? { decisionProvenance: args.input.decisionProvenance }
+              : {}),
           },
           resolvedByAgentId: args.actor.agentId ?? null,
           resolvedByUserId: args.actor.userId ?? null,

@@ -2197,11 +2197,14 @@ async function resolveSpawnTarget(
     if (!resolved) {
       throw new Error(`Command not found in PATH: "${command}"`);
     }
-    const requestedSandboxCommand = options.localProcessSandbox.command?.trim() || "bwrap";
+    const sandboxBackend = options.localProcessSandbox.backend ?? "bubblewrap";
+    const requestedSandboxCommand =
+      options.localProcessSandbox.command?.trim() ||
+      (sandboxBackend === "landlock" ? "paperclip-landlock" : "bwrap");
     const sandboxCommand = await resolveCommandPath(requestedSandboxCommand, cwd, env);
     if (!sandboxCommand) {
       throw new Error(
-        `Local process confinement requires Bubblewrap, but "${requestedSandboxCommand}" was not found in PATH. Install bwrap or configure filesystemSandboxCommand.`,
+        `Local process confinement requires the ${sandboxBackend} backend, but "${requestedSandboxCommand}" was not found in PATH. Install the backend executable or configure filesystemSandboxCommand.`,
       );
     }
     const sandboxTarget = await buildLocalProcessSandboxSpawnTarget({

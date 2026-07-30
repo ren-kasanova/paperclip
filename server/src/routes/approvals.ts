@@ -21,6 +21,7 @@ import {
 import { assertBoard, assertCompanyAccess, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
 import { redactEventPayload } from "../redaction.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
+import { authenticateDeck7Decision } from "./deck7-provenance.js";
 
 function redactApprovalPayload<T extends { payload: Record<string, unknown> }>(approval: T): T {
   return {
@@ -187,6 +188,7 @@ export function approvalRoutes(
 
   router.post("/approvals/:id/approve", validate(resolveApprovalSchema), async (req, res) => {
     assertBoard(req);
+    const decisionProvenance = authenticateDeck7Decision(req);
     const id = req.params.id as string;
     if (!(await requireApprovalAccess(req, id))) {
       res.status(404).json({ error: "Approval not found" });
@@ -211,6 +213,7 @@ export function approvalRoutes(
           type: approval.type,
           requestedByAgentId: approval.requestedByAgentId,
           linkedIssueIds,
+          decisionProvenance,
         },
       });
 

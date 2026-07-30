@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.paperclip.control-plane</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/env</string>
+    <string>-i</string>
+    <string>HOME=/Users/ren</string>
+    <string>PATH=/Users/ren/.nvm/versions/node/v22.22.2/bin:/Users/ren/.local/bin:/Users/ren/.brv-cli/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <string>TMPDIR=/private/tmp</string>
+    <string>NODE_ENV=production</string>
+    <string>PAPERCLIP_NO_BROWSER=1</string>
+    <string>/Users/ren/.nvm/versions/node/v22.22.2/bin/node</string>
+    <string>/Users/ren/.local/share/paperclip-control-plane/node_modules/paperclipai/dist/index.js</string>
+    <string>run</string>
+    <string>--data-dir</string>
+    <string>/Users/ren/.local/share/paperclip-control-plane/data</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/ren/.local/share/paperclip-control-plane</string>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+
+  <key>ThrottleInterval</key>
+  <integer>5</integer>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+
+  <key>StandardOutPath</key>
+  <string>/Users/ren/Library/Logs/Paperclip/stdout.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/Users/ren/Library/Logs/Paperclip/stderr.log</string>
+</dict>
+</plist>

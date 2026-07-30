@@ -51,6 +51,7 @@ function buildResolvedWorkspace(overrides: Partial<ResolvedWorkspaceForRun> = {}
   return {
     cwd: "/tmp/project",
     source: "project_primary",
+    sourceType: "local_path",
     projectId: "project-1",
     workspaceId: "workspace-1",
     repoUrl: null,
@@ -434,6 +435,34 @@ describe("assertGitSensitiveAdapterWorkspaceValid", () => {
       "missing_git_metadata",
       "has no .git metadata",
     );
+  });
+
+  it("allows an explicitly non-git project workspace for a git-sensitive local adapter", async () => {
+    const input = buildWorkspaceValidationInput();
+    const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-non-git-workspace-"));
+    try {
+      await expect(
+        assertGitSensitiveAdapterWorkspaceValid(
+          buildWorkspaceValidationInput({
+            resolvedWorkspace: buildResolvedWorkspace({
+              cwd,
+              sourceType: "non_git_path",
+            }),
+            executionWorkspace: {
+              ...input.executionWorkspace,
+              baseCwd: cwd,
+              cwd,
+            },
+            persistedExecutionWorkspace: {
+              ...input.persistedExecutionWorkspace!,
+              cwd,
+            },
+          }),
+        ),
+      ).resolves.toBeUndefined();
+    } finally {
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
   });
 
   it("does not apply the git-sensitive workspace guard to non-local execution targets", async () => {
