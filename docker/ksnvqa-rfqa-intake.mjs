@@ -7,14 +7,19 @@ import {
   unlink,
   writeFile,
 } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import path from "node:path";
 
 import {
+  boundedSourceTitle,
   deliveryMonitorCandidates,
+  extractRejectionObservations,
   extractUnresolvedRejections,
+  migrateLifecycleState,
   monitorHasLivePath,
   productionApprovalTargetViolation,
   rejectionCycleMarker,
+  stageDispatchKey,
 } from "./ksnvqa-lifecycle-core.mjs";
 
 const required = [
@@ -55,30 +60,35 @@ const config = {
   stateDir: process.env.STATE_DIR,
   cycleWindowMs: Number(process.env.LIFECYCLE_CYCLE_WINDOW_HOURS || 24) * 60 * 60 * 1000,
   maxStageEntries: Number(process.env.LIFECYCLE_MAX_STAGE_ENTRIES || 3),
+  requestTimeoutMs: Number(process.env.LIFECYCLE_REQUEST_TIMEOUT_MS || 10_000),
 };
 
 const stages = [
   {
     state: "Ready for QA",
     slug: "ready_for_qa",
+    action: "Ready for QA",
     event: "linear.issue.entered_ready_for_qa",
     routineId: process.env.PAPERCLIP_RFQA_ROUTINE_ID,
   },
   {
     state: "Ready for Release",
     slug: "ready_for_release",
+    action: "production promotion",
     event: "linear.issue.entered_ready_for_release",
     routineId: process.env.PAPERCLIP_RFR_ROUTINE_ID,
   },
   {
     state: "Production Validation",
     slug: "production_validation",
+    action: "production validation",
     event: "linear.issue.entered_production_validation",
     routineId: process.env.PAPERCLIP_PRODUCTION_VALIDATION_ROUTINE_ID,
   },
   {
     state: "Done",
     slug: "done",
+    action: "Done evidence audit",
     event: "linear.issue.entered_done",
     routineId: process.env.PAPERCLIP_DONE_ROUTINE_ID,
   },
@@ -107,11 +117,21 @@ async function writeJsonAtomic(file, value) {
 async function acquireLock() {
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
+      const token = randomUUID();
       const handle = await open(lockFile, "wx", 0o600);
       await handle.writeFile(
-        `${JSON.stringify({ pid: process.pid, acquiredAt: new Date().toISOString() })}\n`,
+        `${JSON.stringify({
+          pid: process.pid,
+          token,
+          acquiredAt: new Date().toISOString(),
+        })}\n`,
       );
-      return handle;
+      const heartbeat = setInterval(() => {
+        const now = new Date();
+        handle.utimes(now, now).catch(() => {});
+      }, 30_000);
+      heartbeat.unref();
+      return { handle, heartbeat, token };
     } catch (error) {
       if (error?.code !== "EEXIST") throw error;
       let lockStat;
@@ -134,16 +154,31 @@ async function acquireLock() {
 
 async function releaseLock(handle) {
   if (!handle) return;
-  await handle.close();
+  clearInterval(handle.heartbeat);
+  await handle.handle.close();
   try {
-    await unlink(lockFile);
+    const current = await readJson(lockFile, null);
+    if (current?.token === handle.token) await unlink(lockFile);
   } catch (error) {
     if (error?.code !== "ENOENT") throw error;
   }
 }
 
 async function fetchJson(url, options = {}) {
-  const response = await fetch(url, options);
+  let response;
+  try {
+    response = await fetch(url, {
+      ...options,
+      signal: options.signal || AbortSignal.timeout(config.requestTimeoutMs),
+    });
+  } catch (error) {
+    if (error?.name === "AbortError" || error?.name === "TimeoutError") {
+      throw new Error(
+        `${options.method || "GET"} ${url} timed out after ${config.requestTimeoutMs} ms`,
+      );
+    }
+    throw error;
+  }
   const text = await response.text();
   let body;
   try {
@@ -158,7 +193,7 @@ async function fetchJson(url, options = {}) {
   return body;
 }
 
-async function fetchIssuesByState(state, { includeComments = false } = {}) {
+async function fetchIssuesByState(state) {
   const query = `
     query KasanovaIssuesByState($state: String!, $after: String) {
       issues(
@@ -174,11 +209,6 @@ async function fetchIssuesByState(state, { includeComments = false } = {}) {
           updatedAt
           state { name }
           team { key name }
-          ${
-            includeComments
-              ? "comments(last: 100) { nodes { id body createdAt updatedAt } }"
-              : ""
-          }
         }
         pageInfo { hasNextPage endCursor }
       }
@@ -210,6 +240,50 @@ async function fetchIssuesByState(state, { includeComments = false } = {}) {
   return issues;
 }
 
+async function fetchIssueWithAllComments(issueId) {
+  const query = `
+    query KasanovaIssueComments($id: String!, $after: String) {
+      issue(id: $id) {
+        id
+        identifier
+        title
+        url
+        updatedAt
+        state { name }
+        team { key name }
+        comments(first: 50, after: $after) {
+          nodes { id body createdAt updatedAt }
+          pageInfo { hasNextPage endCursor }
+        }
+      }
+    }
+  `;
+  const comments = [];
+  let after = null;
+  let issue = null;
+  do {
+    const result = await fetchJson(config.linearApiUrl, {
+      method: "POST",
+      headers: {
+        authorization: config.linearApiKey,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ query, variables: { id: issueId, after } }),
+    });
+    if (result?.errors?.length) {
+      throw new Error(
+        `Linear GraphQL error: ${result.errors.map((entry) => entry.message).join("; ")}`,
+      );
+    }
+    issue = result?.data?.issue;
+    if (!issue) throw new Error(`Linear response did not contain issue ${issueId}`);
+    const page = issue.comments;
+    comments.push(...(page?.nodes || []));
+    after = page?.pageInfo?.hasNextPage ? page.pageInfo.endCursor : null;
+  } while (after);
+  return { ...issue, comments: { nodes: comments } };
+}
+
 async function fetchLifecycleIssues() {
   const results = [];
   for (const stage of stages) {
@@ -220,10 +294,45 @@ async function fetchLifecycleIssues() {
 }
 
 async function fetchInProgressIssuesWithComments() {
-  return fetchIssuesByState("In Progress", { includeComments: true });
+  const issues = await fetchIssuesByState("In Progress");
+  const hydrated = [];
+  for (const issue of issues) {
+    hydrated.push(await fetchIssueWithAllComments(issue.id));
+  }
+  return hydrated;
 }
 
-async function dispatchIssue(issue) {
+async function fetchTrackedCycleIssuesWithComments(previousCycles, knownIssueIds) {
+  const unresolvedIssueIds = new Set(
+    Object.values(previousCycles || {})
+      .filter(
+        (cycle) =>
+          cycle?.linearIssueId &&
+          !String(cycle.status || "").startsWith("resolved_") &&
+          !String(cycle.status || "").startsWith("closed_"),
+      )
+      .map((cycle) => cycle.linearIssueId),
+  );
+  const issues = [];
+  for (const issueId of unresolvedIssueIds) {
+    if (knownIssueIds.has(issueId)) continue;
+    issues.push(await fetchIssueWithAllComments(issueId));
+  }
+  return issues;
+}
+
+function routineSubject(issue) {
+  const rendered = boundedSourceTitle(
+    issue.identifier,
+    issue.title,
+    issue.stage.action,
+  );
+  const prefix = `[${issue.identifier}] `;
+  const suffix = ` — ${issue.stage.action}`;
+  return rendered.slice(prefix.length, rendered.length - suffix.length);
+}
+
+async function dispatchIssue(issue, entrySequence) {
   return fetchJson(`${config.paperclipApiUrl}/routines/${issue.stage.routineId}/run`, {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -232,10 +341,14 @@ async function dispatchIssue(issue) {
       projectId: config.projectId,
       projectWorkspaceId: config.projectWorkspaceId,
       assigneeAgentId: config.assigneeAgentId,
-      idempotencyKey: `linear-stage:${issue.id}:${issue.stage.slug}:${issue.updatedAt}`,
+      idempotencyKey: stageDispatchKey(
+        issue.id,
+        issue.stage.slug,
+        entrySequence,
+      ),
       variables: {
         linear_identifier: issue.identifier,
-        linear_title: issue.title,
+        linear_title: routineSubject(issue),
       },
       payload: {
         event: issue.stage.event,
@@ -259,6 +372,10 @@ async function fetchPaperclipIssues() {
     throw new Error("Paperclip company issues endpoint returned an invalid response");
   }
   return issues;
+}
+
+async function fetchPaperclipIssue(issueId) {
+  return fetchJson(`${config.paperclipApiUrl}/issues/${issueId}`);
 }
 
 async function postIssueComment(issueId, body) {
@@ -368,7 +485,11 @@ async function createDeliveryMonitor(linearIssue, paperclipIssues, rejectionComm
     projectId: config.projectId,
     projectWorkspaceId: config.projectWorkspaceId,
     parentId: parent?.id || null,
-    title: `[${linearIssue.identifier}] ${linearIssue.title} — Delivery QA-return monitor`,
+    title: boundedSourceTitle(
+      linearIssue.identifier,
+      linearIssue.title,
+      "Delivery QA-return monitor",
+    ),
     description: [
       `Persist the delivery-owned QA-return loop for [${linearIssue.identifier}](${linearIssue.url}).`,
       "",
@@ -385,9 +506,45 @@ async function createDeliveryMonitor(linearIssue, paperclipIssues, rejectionComm
   return monitor;
 }
 
+async function surfaceLifecycleInvariant({
+  linearIssue,
+  paperclipIssues,
+  rejectionCommentId,
+  kind,
+  reason,
+}) {
+  const parent = latestSourceBoundIssue(paperclipIssues, linearIssue.identifier);
+  const created = await createPaperclipIssue({
+    projectId: config.projectId,
+    projectWorkspaceId: config.projectWorkspaceId,
+    parentId: parent?.id || null,
+    title: boundedSourceTitle(
+      linearIssue.identifier,
+      linearIssue.title,
+      `lifecycle invariant: ${kind}`,
+    ),
+    description: [
+      `The zero-token lifecycle watcher cannot complete the QA-return route for [${linearIssue.identifier}](${linearIssue.url}).`,
+      "",
+      `- Invariant: ${reason}`,
+      `- Immutable rejection comment: \`${rejectionCommentId}\``,
+      "- Required action: repair the canonical Delivery monitor state, then leave the immutable rejection cycle intact so the watcher can resume it.",
+    ].join("\n"),
+    status: "todo",
+    priority: "high",
+    assigneeAgentId: null,
+    assigneeUserId: "local-board",
+    idempotencyKey:
+      `ksnvqa-lifecycle-invariant:${linearIssue.id}:${rejectionCommentId}:${kind}`,
+  });
+  paperclipIssues.push(created);
+  return created;
+}
+
 async function enforceRejectionCycles(
   inProgressIssues,
   lifecycleIssues,
+  observedCycleIssues,
   paperclipIssues,
   previousCycles,
 ) {
@@ -395,11 +552,19 @@ async function enforceRejectionCycles(
   const violations = [];
   const evidenceWarnings = [];
   const repaired = [];
+  const observations = extractRejectionObservations(observedCycleIssues);
+  const observationByCommentId = new Map(
+    observations.map((entry) => [entry.comment.id, entry]),
+  );
   const detected = extractUnresolvedRejections(inProgressIssues);
   const detectedIds = new Set(detected.map((entry) => entry.comment.id));
   const currentStateByIssueId = new Map([
     ...inProgressIssues.map((issue) => [issue.id, issue.state?.name || "In Progress"]),
     ...lifecycleIssues.map((issue) => [issue.id, issue.stage.state]),
+    ...observedCycleIssues.map((issue) => [
+      issue.id,
+      issue.state?.name || "Unknown",
+    ]),
   ]);
 
   for (const rejection of detected) {
@@ -416,12 +581,21 @@ async function enforceRejectionCycles(
     };
 
     if (!completeness.complete) {
+      const invalidParts = [
+        completeness.missing.length > 0
+          ? `missing structured fields: ${completeness.missing.join(", ")}`
+          : null,
+        completeness.duplicates.length > 0
+          ? `duplicate structured fields: ${completeness.duplicates.join(", ")}`
+          : null,
+      ].filter(Boolean);
       const reason =
-        `${linearIssue.identifier} rejection ${comment.id} is missing structured fields: ` +
-        completeness.missing.join(", ");
+        `${linearIssue.identifier} rejection ${comment.id} has invalid evidence: ` +
+        invalidParts.join("; ");
       evidenceWarnings.push(reason);
       cycle.evidenceWarning = reason;
       cycle.missingFields = completeness.missing;
+      cycle.duplicateFields = completeness.duplicates;
       const sourceIssue = latestSourceBoundIssue(paperclipIssues, linearIssue.identifier);
       if (sourceIssue && !["done", "cancelled"].includes(sourceIssue.status)) {
         await ensureIssueComment(
@@ -441,6 +615,7 @@ async function enforceRejectionCycles(
     } else {
       delete cycle.evidenceWarning;
       delete cycle.missingFields;
+      delete cycle.duplicateFields;
     }
 
     let candidates = deliveryMonitorCandidates(
@@ -463,6 +638,17 @@ async function enforceRejectionCycles(
       violations.push(reason);
       cycle.status = "blocked_monitor_cardinality";
       cycle.paperclipIssueIds = candidates.map((candidate) => candidate.id);
+      if (!cycle.invariantIssueId) {
+        const invariant = await surfaceLifecycleInvariant({
+          linearIssue,
+          paperclipIssues,
+          rejectionCommentId: comment.id,
+          kind: "monitor-cardinality",
+          reason,
+        });
+        cycle.invariantIssueId = invariant.id;
+        cycle.invariantIdentifier = invariant.identifier;
+      }
       cycles[comment.id] = cycle;
       continue;
     }
@@ -475,15 +661,32 @@ async function enforceRejectionCycles(
         `${linearIssue.identifier} canonical Delivery monitor ${monitor.identifier} is cancelled and requires Ren to choose recovery`;
       violations.push(reason);
       cycle.status = "blocked_cancelled_monitor";
+      if (!cycle.invariantIssueId) {
+        const invariant = await surfaceLifecycleInvariant({
+          linearIssue,
+          paperclipIssues,
+          rejectionCommentId: comment.id,
+          kind: "cancelled-monitor",
+          reason,
+        });
+        cycle.invariantIssueId = invariant.id;
+        cycle.invariantIdentifier = invariant.identifier;
+      }
       cycles[comment.id] = cycle;
       continue;
     }
 
     const interactions = await fetchIssueInteractions(monitor.id);
-    if (monitorHasLivePath(monitor, interactions)) {
+    const eligibleMonitor =
+      monitor.assigneeAgentId === config.deliveryAgentId &&
+      monitor.assigneeUserId == null &&
+      ["in_progress", "in_review"].includes(monitor.status);
+    if (eligibleMonitor && monitorHasLivePath(monitor, interactions)) {
       cycle.status = interactions.some((interaction) => interaction.status === "pending")
         ? "routed_pending_interaction"
-        : "routed_live_execution";
+        : monitor.monitorNextCheckAt
+          ? "routed_monitor"
+          : "routed_live_execution";
       cycles[comment.id] = cycle;
       continue;
     }
@@ -518,16 +721,46 @@ async function enforceRejectionCycles(
 
   for (const [commentId, cycle] of Object.entries(cycles)) {
     if (detectedIds.has(commentId)) continue;
+    if (
+      String(cycle.status || "").startsWith("resolved_") ||
+      String(cycle.status || "").startsWith("closed_")
+    ) {
+      continue;
+    }
     const currentState = currentStateByIssueId.get(cycle.linearIssueId);
-    if (!currentState) continue;
+    const observation = observationByCommentId.get(commentId);
+    if (observation?.resolved) {
+      cycles[commentId] = {
+        ...cycle,
+        status: "resolved_return_observed",
+        resolutionCommentId: observation.resolutionCommentId,
+        lastObservedState: currentState || observation.issue.state?.name || null,
+        resolvedAt: cycle.resolvedAt || new Date().toISOString(),
+        lastSeenAt: new Date().toISOString(),
+      };
+      continue;
+    }
+    if (["Canceled", "Cancelled", "Duplicate"].includes(currentState)) {
+      cycles[commentId] = {
+        ...cycle,
+        status: "closed_terminal_linear_state",
+        lastObservedState: currentState,
+        resolvedAt: cycle.resolvedAt || new Date().toISOString(),
+        lastSeenAt: new Date().toISOString(),
+      };
+      continue;
+    }
+    const reason = observation
+      ? `${cycle.identifier} rejection ${commentId} is still unresolved but disappeared from the In Progress intake`
+      : `${cycle.identifier} rejection ${commentId} could not be verified in the complete Linear comment history`;
+    violations.push(reason);
     cycles[commentId] = {
       ...cycle,
-      status:
-        currentState === "In Progress"
-          ? "resolved_return_observed"
-          : "resolved_or_advanced",
-      lastObservedState: currentState,
-      resolvedAt: cycle.resolvedAt || new Date().toISOString(),
+      status: observation
+        ? "unresolved_outside_in_progress"
+        : "unverified_rejection_missing",
+      invariantViolation: reason,
+      lastObservedState: currentState || null,
       lastSeenAt: new Date().toISOString(),
     };
   }
@@ -554,7 +787,34 @@ async function reportCycleGuard(issue, paperclipIssues, count) {
     );
   const target = candidates[0];
   if (!target?.id) {
-    throw new Error(`No active Paperclip issue found for lifecycle guard ${issue.identifier}`);
+    const created = await createPaperclipIssue({
+      projectId: config.projectId,
+      projectWorkspaceId: config.projectWorkspaceId,
+      title: boundedSourceTitle(
+        issue.identifier,
+        issue.title,
+        "lifecycle churn guard",
+      ),
+      description: [
+        `Automatic lifecycle dispatch stopped for [${issue.identifier}](${issue.url}).`,
+        "",
+        `- Stage: \`${issue.stage.state}\``,
+        `- Observed entries within 24 hours: ${count}`,
+        "- Required action: inspect and resolve the state ping-pong before another automated QA cycle.",
+      ].join("\n"),
+      status: "todo",
+      priority: "high",
+      assigneeAgentId: config.assigneeAgentId,
+      assigneeUserId: null,
+      idempotencyKey:
+        `ksnvqa-lifecycle-guard:${issue.id}:${issue.stage.slug}:${count}`,
+    });
+    paperclipIssues.push(created);
+    return {
+      targetIssueId: created.id,
+      targetIdentifier: created.identifier,
+      created: true,
+    };
   }
   await postIssueComment(
     target.id,
@@ -568,6 +828,11 @@ async function reportCycleGuard(issue, paperclipIssues, count) {
       "- Kasanova QA must inspect the lifecycle history and resolve the ping-pong before another cycle.",
     ].join("\n"),
   );
+  return {
+    targetIssueId: target.id,
+    targetIdentifier: target.identifier,
+    created: false,
+  };
 }
 
 async function enforceDeliveryMonitorInvariant(paperclipIssues, previousNotifications) {
@@ -582,48 +847,51 @@ async function enforceDeliveryMonitorInvariant(paperclipIssues, previousNotifica
     if (!isMonitor || !eligibleStatus) continue;
 
     const interactions = await fetchIssueInteractions(issue.id);
-    if (monitorHasLivePath(issue, interactions)) {
-      delete notifications[issue.id];
-      continue;
-    }
-
-    const violation =
+    const ownerDrift =
       issue.assigneeAgentId !== config.deliveryAgentId ||
-      issue.assigneeUserId != null ||
-      !issue.monitorNextCheckAt;
-    if (!violation) {
+      issue.assigneeUserId != null;
+    if (!ownerDrift && monitorHasLivePath(issue, interactions)) {
       delete notifications[issue.id];
       continue;
     }
-    const rejectionCommentId =
-      String(issue.executionPolicy?.monitor?.externalRef || "")
-        .match(/(?:^|\|)linear-comment:([^|]+)/)?.[1] || null;
-    const executionPolicy = monitorPolicy(
-      issue,
-      rejectionCommentId,
-      2 * 60 * 60 * 1000,
-    );
-    await patchIssue(issue.id, {
-      assigneeAgentId: config.deliveryAgentId,
-      assigneeUserId: null,
-      executionPolicy,
-    });
-    repaired.push(issue.identifier);
-    if (notifications[issue.id]) continue;
-    await postIssueComment(
-      issue.id,
-      [
-        "## Delivery monitor invariant repaired",
-        "",
-        "The zero-token Kasanova lifecycle watcher restored this active QA-return monitor's persisted wake path.",
-        "",
-        "- Owner: Kasanova Delivery; no user assignee.",
-        `- Next check: \`${executionPolicy.monitor.nextCheckAt}\`.`,
-        "- Recovery: `wake_owner`, 72-hour timeout, 96-attempt cap.",
-        "- Preserve the same Linear issue, immutable rejection ID, and canonical KSNVQA task.",
-      ].join("\n"),
-    );
-    notifications[issue.id] = new Date().toISOString();
+    try {
+      const detailedIssue = await fetchPaperclipIssue(issue.id);
+      const rejectionCommentId =
+        String(detailedIssue.executionPolicy?.monitor?.externalRef || "")
+          .match(/(?:^|\|)linear-comment:([^|]+)/)?.[1] || null;
+      const executionPolicy = monitorPolicy(
+        detailedIssue,
+        rejectionCommentId,
+        2 * 60 * 60 * 1000,
+      );
+      await patchIssue(issue.id, {
+        assigneeAgentId: config.deliveryAgentId,
+        assigneeUserId: null,
+        executionPolicy,
+      });
+      repaired.push(issue.identifier);
+      if (notifications[issue.id]) continue;
+      await postIssueComment(
+        issue.id,
+        [
+          "## Delivery monitor invariant repaired",
+          "",
+          "The zero-token Kasanova lifecycle watcher restored this active QA-return monitor's persisted wake path.",
+          "",
+          "- Owner: Kasanova Delivery; no user assignee.",
+          `- Next check: \`${executionPolicy.monitor.nextCheckAt}\`.`,
+          "- Recovery: `wake_owner`, 72-hour timeout, 96-attempt cap.",
+          "- Preserve the same Linear issue, immutable rejection ID, and canonical KSNVQA task.",
+        ].join("\n"),
+      );
+      notifications[issue.id] = new Date().toISOString();
+    } catch (error) {
+      violations.push(
+        `${issue.identifier} Delivery monitor repair failed: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
   }
   return { notifications, violations, repaired };
 }
@@ -752,41 +1020,25 @@ function countByState(issues) {
 }
 
 async function pollLifecycle() {
-  const previous = await readJson(stateFile, null);
-  const issues = await fetchLifecycleIssues();
-  const inProgressIssues = await fetchInProgressIssuesWithComments();
   const now = new Date().toISOString();
   const nowMs = new Date(now).getTime();
+  const previous = migrateLifecycleState(
+    await readJson(stateFile, null),
+    now,
+  );
+  const issues = await fetchLifecycleIssues();
+  const inProgressIssues = await fetchInProgressIssuesWithComments();
+  const trackedCycleIssues = await fetchTrackedCycleIssuesWithComments(
+    previous?.rejectionCycles,
+    new Set(inProgressIssues.map((issue) => issue.id)),
+  );
+  const observedCycleIssues = [...inProgressIssues, ...trackedCycleIssues];
   const paperclipIssues = await fetchPaperclipIssues();
 
-  if (previous && ![2, 3, 4].includes(previous.version)) {
-    throw new Error(`Unsupported lifecycle watcher state version: ${previous.version}`);
-  }
-
-  let state = previous;
-  if (previous?.version === 2) {
-    state = {
-      ...previous,
-      version: 3,
-      migratedAt: now,
-      transitionHistory: {},
-      guardNotifications: {},
-      monitorInvariantNotifications: {},
-      withdrawnPolicyInteractions: {},
-    };
-  }
-  if (state?.version === 3) {
-    state = {
-      ...state,
-      version: 4,
-      migratedAt: now,
-      rejectionCycles: {},
-    };
-  }
-
-  if (!state) {
+  if (!previous) {
     const active = {};
     const transitionHistory = {};
+    const entrySequences = {};
     let dispatched = 0;
     for (const issue of issues) {
       if (issue.stage.state === "Done") {
@@ -799,14 +1051,17 @@ async function pollLifecycle() {
         continue;
       }
       try {
-        const run = await dispatchIssue(issue);
+        const key = historyKey(issue);
+        const entrySequence = (entrySequences[key] || 0) + 1;
+        const run = await dispatchIssue(issue, entrySequence);
         active[issue.id] = {
           identifier: issue.identifier,
           state: issue.stage.state,
           enteredAt: issue.updatedAt,
           routineRunId: run.id,
         };
-        transitionHistory[historyKey(issue)] = [now];
+        transitionHistory[key] = [now];
+        entrySequences[key] = entrySequence;
         dispatched += 1;
       } catch (error) {
         process.stderr.write(
@@ -814,20 +1069,34 @@ async function pollLifecycle() {
         );
       }
     }
+    await writeJsonAtomic(stateFile, {
+      version: 5,
+      initializedAt: now,
+      lastPollAt: now,
+      active,
+      transitionHistory,
+      entrySequences,
+      guardNotifications: {},
+      monitorInvariantNotifications: {},
+      withdrawnPolicyInteractions: {},
+      rejectionCycles: {},
+    });
     const rejectionResult = await enforceRejectionCycles(
       inProgressIssues,
       issues,
+      observedCycleIssues,
       paperclipIssues,
       {},
     );
     const monitorResult = await enforceDeliveryMonitorInvariant(paperclipIssues, {});
     const interactionResult = await enforceInteractionPolicy({});
     await writeJsonAtomic(stateFile, {
-      version: 4,
+      version: 5,
       initializedAt: now,
       lastPollAt: now,
       active,
       transitionHistory,
+      entrySequences,
       guardNotifications: {},
       monitorInvariantNotifications: monitorResult.notifications,
       withdrawnPolicyInteractions: interactionResult.handled,
@@ -856,12 +1125,14 @@ async function pollLifecycle() {
   }
 
   const nextActive = {};
-  const transitionHistory = pruneHistory(state.transitionHistory, nowMs);
-  const guardNotifications = { ...(state.guardNotifications || {}) };
+  const transitionHistory = pruneHistory(previous.transitionHistory, nowMs);
+  const entrySequences = { ...(previous.entrySequences || {}) };
+  const guardNotifications = { ...(previous.guardNotifications || {}) };
+  const guardWarnings = [];
   let dispatched = 0;
   let guarded = 0;
   for (const issue of issues) {
-    const existing = state.active?.[issue.id];
+    const existing = previous.active?.[issue.id];
     if (existing?.state === issue.stage.state) {
       nextActive[issue.id] = existing;
       continue;
@@ -870,7 +1141,15 @@ async function pollLifecycle() {
     const entries = transitionHistory[key] || [];
     if (entries.length >= config.maxStageEntries) {
       if (!guardNotifications[key]) {
-        await reportCycleGuard(issue, paperclipIssues, entries.length);
+        try {
+          await reportCycleGuard(issue, paperclipIssues, entries.length);
+        } catch (error) {
+          guardWarnings.push(
+            `${issue.identifier} lifecycle guard could not be surfaced: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+        }
         guardNotifications[key] = now;
       }
       nextActive[issue.id] = {
@@ -884,7 +1163,8 @@ async function pollLifecycle() {
       continue;
     }
     try {
-      const run = await dispatchIssue(issue);
+      const entrySequence = (entrySequences[key] || 0) + 1;
+      const run = await dispatchIssue(issue, entrySequence);
       nextActive[issue.id] = {
         identifier: issue.identifier,
         state: issue.stage.state,
@@ -892,6 +1172,7 @@ async function pollLifecycle() {
         routineRunId: run.id,
       };
       transitionHistory[key] = [...entries, now];
+      entrySequences[key] = entrySequence;
       dispatched += 1;
       process.stdout.write(
         `${now} dispatched ${issue.identifier} in ${issue.stage.state} as routine run ${run.id}\n`,
@@ -903,27 +1184,45 @@ async function pollLifecycle() {
     }
   }
 
-  const rejectionResult = await enforceRejectionCycles(
-    inProgressIssues,
-    issues,
-    paperclipIssues,
-    state.rejectionCycles,
-  );
-  const monitorResult = await enforceDeliveryMonitorInvariant(
-    paperclipIssues,
-    state.monitorInvariantNotifications,
-  );
-  const interactionResult = await enforceInteractionPolicy(
-    state.withdrawnPolicyInteractions,
-  );
-
   await writeJsonAtomic(stateFile, {
-    version: 4,
-    initializedAt: state.initializedAt || now,
-    migratedAt: state.migratedAt,
+    version: 5,
+    initializedAt: previous.initializedAt || now,
+    migratedAt: previous.migratedAt,
     lastPollAt: now,
     active: nextActive,
     transitionHistory,
+    entrySequences,
+    guardNotifications,
+    monitorInvariantNotifications:
+      previous.monitorInvariantNotifications || {},
+    withdrawnPolicyInteractions:
+      previous.withdrawnPolicyInteractions || {},
+    rejectionCycles: previous.rejectionCycles || {},
+  });
+
+  const rejectionResult = await enforceRejectionCycles(
+    inProgressIssues,
+    issues,
+    observedCycleIssues,
+    paperclipIssues,
+    previous.rejectionCycles,
+  );
+  const monitorResult = await enforceDeliveryMonitorInvariant(
+    paperclipIssues,
+    previous.monitorInvariantNotifications,
+  );
+  const interactionResult = await enforceInteractionPolicy(
+    previous.withdrawnPolicyInteractions,
+  );
+
+  await writeJsonAtomic(stateFile, {
+    version: 5,
+    initializedAt: previous.initializedAt || now,
+    migratedAt: previous.migratedAt,
+    lastPollAt: now,
+    active: nextActive,
+    transitionHistory,
+    entrySequences,
     guardNotifications,
     monitorInvariantNotifications: monitorResult.notifications,
     withdrawnPolicyInteractions: interactionResult.handled,
@@ -935,6 +1234,7 @@ async function pollLifecycle() {
     activeByState: countByState(issues),
     dispatched,
     guarded,
+    lifecycleGuardWarnings: guardWarnings,
     monitorInvariantViolations: monitorResult.violations,
     monitorInvariantRepairs: monitorResult.repaired,
     withdrawnInvalidConfirmations: interactionResult.withdrawn,

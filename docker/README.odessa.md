@@ -12,17 +12,31 @@ never return to a single-file watcher bind because atomic source updates leave
 that bind pinned to a deleted inode.
 
 The lifecycle watcher serializes its Linear reads and holds an atomic,
-stale-safe state lock so timer and event wakes cannot process the same cycle
-concurrently. State schema v4 keeps a durable rejection ledger keyed by the
-immutable Linear `QA REJECTED` comment ID. While the source issue is `In
-Progress`, the watcher audits the structured rejection, creates or reopens
-the single source-bound Delivery monitor idempotently, and records the cycle ID
-in both the monitor policy and a read-before-write Paperclip comment.
+heartbeat-refreshed, ownership-token lock so timer and event wakes cannot
+process the same cycle concurrently. Every upstream request has a bounded
+timeout. State schema v5 keeps durable stage-entry sequences for stable
+dispatch idempotency and a rejection ledger keyed by the immutable Linear
+`QA REJECTED` comment ID. A successful routine dispatch is checkpointed before
+the watcher performs later enforcement, so a crash cannot duplicate the stage
+task.
+
+While the source issue is `In Progress`, the watcher reads the complete
+paginated Linear comment history, audits the structured rejection, creates or
+reopens the single source-bound Delivery monitor idempotently, and records the
+cycle ID in both the monitor policy and a read-before-write Paperclip comment.
 Incomplete historical formatting is a durable evidence warning but does not
-strand the immutable handoff. A
-`QA RETURN RESOLVED` closes that cycle only when it cites the exact rejection
-ID. `done` monitors can be reopened; `cancelled` monitors fail closed and are
-reported as invariant violations.
+strand the immutable handoff. A `QA RETURN RESOLVED` closes that cycle only
+when it cites the exact rejection ID. The watcher continues observing the
+source issue after it leaves `In Progress`; advancement without the cited
+return is an invariant violation, not implicit success. Legacy
+`resolved_or_advanced` ledger entries are re-verified under this rule. `done`
+monitors can be reopened; `cancelled` monitors fail closed and are reported as
+source-bound invariant work.
+
+An existing future monitor deadline, active execution, recent wake/trigger, or
+pending interaction is a live delivery path. The minute watcher does not
+rewrite a live deadline, which prevents a frequent poll from postponing the
+monitor forever. A stale deadline with no other live path is repaired.
 
 Each event routine declares required `linear_identifier` and `linear_title`
 variables. The watcher supplies the exact Linear key and source title so its
@@ -69,3 +83,8 @@ dispatched immediately. `Done` is baselined without replay. A migrated watcher
 preserves its prior active set. The watcher caps any one Linear issue at three
 entries into the same stage within 24 hours and leaves a durable Paperclip
 comment for the responsible agent when the guard fires.
+
+The container healthcheck requires the watcher health record to remain `ok`
+and less than five minutes old. `host/reconcile-ksnvqa.mjs --check` audits the
+agent runtime, routine titles and variables, the `0 */8 * * *`
+`America/Monterrey` fallback trigger, and source-bound Paperclip titles.

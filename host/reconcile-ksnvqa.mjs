@@ -5,6 +5,8 @@ const checkOnly = process.argv.includes("--check");
 
 const ids = {
   company: "0590afb4-7120-45c8-9109-62ad5098bb5f",
+  project: "07f395d6-b361-4331-b326-adad957aaf1d",
+  projectWorkspace: "4f5e4412-0d9b-46a9-8c0e-80d3196877e3",
   qa: "c4917415-0eb2-4122-9adb-4868343c9850",
   delivery: "e6f72275-d3c5-4caf-baa5-d01adca1568d",
   intake: "8a0574a8-c666-4926-ba96-59dc351cd8fd",
@@ -15,6 +17,39 @@ const ids = {
     qa: "d9e19810-ca44-4472-91e8-2ee1d1ab820e",
     fallback: "9a48acd0-3ac3-4f62-b685-2f7411bb0de4",
   },
+  fallbackTrigger: "e9b7b55b-c4f3-45e0-8987-e1568f1dba65",
+};
+
+const sourceVariables = [
+  {
+    name: "linear_identifier",
+    type: "text",
+    label: "Linear ticket",
+    options: [],
+    required: true,
+    defaultValue: null,
+  },
+  {
+    name: "linear_title",
+    type: "text",
+    label: "Linear subject",
+    options: [],
+    required: true,
+    defaultValue: null,
+  },
+];
+
+const routineTitles = {
+  [ids.routines.qa]:
+    "[{{linear_identifier}}] {{linear_title}} — Ready for QA",
+  [ids.routines.release]:
+    "[{{linear_identifier}}] {{linear_title}} — production promotion",
+  [ids.routines.production]:
+    "[{{linear_identifier}}] {{linear_title}} — production validation",
+  [ids.routines.done]:
+    "[{{linear_identifier}}] {{linear_title}} — Done evidence audit",
+  [ids.routines.fallback]:
+    "[LINEAR-SWEEP] Kasanova lifecycle fallback monitor — every 8 hours",
 };
 
 const routineDescriptions = {
@@ -33,6 +68,7 @@ const routineDescriptions = {
 async function fetchJson(path, options = {}) {
   const response = await fetch(`${apiBase}${path}`, {
     ...options,
+    signal: options.signal || AbortSignal.timeout(10_000),
     headers: {
       accept: "application/json",
       ...(options.body === undefined ? {} : { "content-type": "application/json" }),
@@ -60,11 +96,21 @@ function plain(value) {
   return { type: "plain", value };
 }
 
-async function reconcileAgent(agentId, mutate, label) {
+async function reconcileAgent(agentId, mutate, label, mutateRuntime = null) {
   const agent = await fetchJson(`/agents/${agentId}`);
   const nextConfig = mutate(structuredClone(agent.adapterConfig || {}));
+  const nextRuntime = mutateRuntime
+    ? mutateRuntime(structuredClone(agent.runtimeConfig || {}))
+    : agent.runtimeConfig || {};
+  const body = {};
   if (JSON.stringify(nextConfig) !== JSON.stringify(agent.adapterConfig || {})) {
-    await patch(`/agents/${agentId}`, { adapterConfig: nextConfig }, label);
+    body.adapterConfig = nextConfig;
+  }
+  if (JSON.stringify(nextRuntime) !== JSON.stringify(agent.runtimeConfig || {})) {
+    body.runtimeConfig = nextRuntime;
+  }
+  if (Object.keys(body).length > 0) {
+    await patch(`/agents/${agentId}`, body, label);
   }
   if (agent.pauseReason === "manual") {
     if (checkOnly) {
@@ -91,16 +137,44 @@ async function reconcileRoutines() {
     const routine = routines.find((entry) => entry.id === routineId);
     if (!routine) throw new Error(`Missing KSNVQA routine ${routineId}`);
     const description = routineDescriptions[routineId];
+    const title = routineTitles[routineId];
     const concurrencyPolicy = eventRoutineIds.has(routineId)
       ? "always_enqueue"
       : "coalesce_if_active";
-    if (routine.concurrencyPolicy !== concurrencyPolicy || routine.description !== description) {
+    const variables = eventRoutineIds.has(routineId) ? sourceVariables : [];
+    if (
+      routine.concurrencyPolicy !== concurrencyPolicy ||
+      routine.description !== description ||
+      routine.title !== title ||
+      JSON.stringify(routine.variables || []) !== JSON.stringify(variables)
+    ) {
       await patch(
         `/routines/${routineId}`,
-        { concurrencyPolicy, description },
+        { concurrencyPolicy, description, title, variables },
         `routine ${routine.title}`,
       );
     }
+  }
+  const fallback = routines.find((entry) => entry.id === ids.routines.fallback);
+  const trigger = fallback?.triggers?.find(
+    (entry) => entry.id === ids.fallbackTrigger,
+  );
+  if (!trigger) throw new Error(`Missing KSNVQA fallback trigger ${ids.fallbackTrigger}`);
+  if (
+    trigger.kind !== "schedule" ||
+    trigger.enabled !== true ||
+    trigger.cronExpression !== "0 */8 * * *" ||
+    trigger.timezone !== "America/Monterrey"
+  ) {
+    await patch(
+      `/routine-triggers/${ids.fallbackTrigger}`,
+      {
+        enabled: true,
+        cronExpression: "0 */8 * * *",
+        timezone: "America/Monterrey",
+      },
+      "Kasanova lifecycle fallback schedule",
+    );
   }
 }
 
@@ -122,49 +196,14 @@ async function reconcileIssueMetadata() {
         `${issue.identifier} canonical Delivery monitor title`,
       );
     }
-  }
-  const productivity = issues.find((entry) => entry.identifier === "KSNVQA-50");
-  const productivityTitle =
-    "[KSNV-161] dApp browser signPsbt/signPsbts QA return — productivity review for KSNVQA-35";
-  if (productivity && productivity.title !== productivityTitle) {
-    await patch(
-      `/issues/${productivity.id}`,
-      { title: productivityTitle },
-      "KSNVQA-50 title",
-    );
-  }
-
-  const monitor = issues.find((entry) => entry.identifier === "KSNVQA-53");
-  if (!monitor) throw new Error("Missing KSNVQA-53 delivery monitor");
-  const hasLiveExecutionPath =
-    Boolean(monitor.executionRunId) ||
-    Boolean(monitor.checkoutRunId) ||
-    ["queued", "running"].includes(monitor.executionState?.status);
-  if (!monitor.monitorNextCheckAt && !hasLiveExecutionPath) {
-    const nextCheckAt = new Date(Date.now() + 2 * 60 * 60 * 1000);
-    const timeoutAt = new Date(Date.now() + 72 * 60 * 60 * 1000);
-    await patch(
-      `/issues/${monitor.id}`,
-      {
-        executionPolicy: {
-          mode: "normal",
-          stages: [],
-          monitor: {
-            kind: "external_service",
-            serviceName: "Kasanova QA lifecycle",
-            externalRef: "linear:KSNV-121;paperclip:KSNVQA-52",
-            nextCheckAt: nextCheckAt.toISOString(),
-            timeoutAt: timeoutAt.toISOString(),
-            maxAttempts: 96,
-            recoveryPolicy: "wake_owner",
-            notes:
-              "Watch the canonical KSNV-121 QA handoff and KSNVQA-52 closeout evidence; re-arm at two hours while QA or an external owner is active.",
-          },
-          commentRequired: true,
-        },
-      },
-      "KSNVQA-53 persisted monitor",
-    );
+    if (
+      issue.projectId === ids.project &&
+      !/^\[(?:KSNV-\d+|LINEAR-SWEEP)\]\s+\S/.test(String(issue.title || ""))
+    ) {
+      throw new Error(
+        `${issue.identifier} has a Kasanova lifecycle title without an exact Linear prefix: ${issue.title}`,
+      );
+    }
   }
 }
 
@@ -236,11 +275,41 @@ await reconcileAgent(
   ids.intake,
   (config) => {
     config.env ||= {};
+    config.cwd = "/app";
+    config.command = "node";
+    config.args = ["/opt/paperclip-watcher/ksnvqa-rfqa-intake.mjs"];
+    config.timeoutSec = 45;
+    config.env.STATE_DIR = plain(
+      "/paperclip/instances/default/data/ksnvqa-rfqa-intake",
+    );
+    config.env.KSNVQA_PAPERCLIP_API_URL = plain("http://127.0.0.1:3101/api");
+    config.env.LINEAR_IDENTIFIER_PREFIX = plain("KSNV-");
     config.env.PAPERCLIP_COMPANY_ID = plain(ids.company);
+    config.env.PAPERCLIP_PROJECT_ID = plain(ids.project);
+    config.env.PAPERCLIP_PROJECT_WORKSPACE_ID = plain(ids.projectWorkspace);
+    config.env.PAPERCLIP_ASSIGNEE_AGENT_ID = plain(ids.qa);
     config.env.PAPERCLIP_DELIVERY_AGENT_ID = plain(ids.delivery);
+    config.env.PAPERCLIP_RFQA_ROUTINE_ID = plain(ids.routines.qa);
+    config.env.PAPERCLIP_RFR_ROUTINE_ID = plain(ids.routines.release);
+    config.env.PAPERCLIP_PRODUCTION_VALIDATION_ROUTINE_ID = plain(
+      ids.routines.production,
+    );
+    config.env.PAPERCLIP_DONE_ROUTINE_ID = plain(ids.routines.done);
     return config;
   },
   "Kasanova Lifecycle Intake agent",
+  (runtime) => {
+    runtime.heartbeat = {
+      ...(runtime.heartbeat || {}),
+      enabled: true,
+      intervalSec: 60,
+      wakeOnOnDemand: true,
+      wakeOnAssignment: false,
+      wakeOnAutomation: true,
+      maxConcurrentRuns: 1,
+    };
+    return runtime;
+  },
 );
 
 await reconcileRoutines();

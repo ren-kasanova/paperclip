@@ -2,11 +2,16 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  boundedSourceTitle,
   deliveryMonitorCandidates,
+  extractRejectionObservations,
   extractUnresolvedRejections,
+  migrateLifecycleState,
   monitorHasLivePath,
   productionApprovalTargetViolation,
+  rejectionCompleteness,
   rejectionCycleMarker,
+  stageDispatchKey,
 } from "./ksnvqa-lifecycle-core.mjs";
 
 const structuredRejection = [
@@ -41,7 +46,11 @@ test("finds one complete unresolved rejection by immutable comment id", () => {
   const result = extractUnresolvedRejections([issue]);
   assert.equal(result.length, 1);
   assert.equal(result[0].comment.id, "11111111-1111-4111-8111-111111111111");
-  assert.deepEqual(result[0].completeness, { complete: true, missing: [] });
+  assert.deepEqual(result[0].completeness, {
+    complete: true,
+    missing: [],
+    duplicates: [],
+  });
 });
 
 test("requires a later QA return to cite the exact rejection id", () => {
@@ -90,6 +99,167 @@ test("a pending interaction is a live monitor path", () => {
     true,
   );
   assert.equal(monitorHasLivePath({}, []), false);
+});
+
+test("a persisted schedule or freshly triggered monitor is a live path", () => {
+  assert.equal(
+    monitorHasLivePath(
+      { monitorNextCheckAt: "2026-07-30T12:30:00.000Z" },
+      [],
+      Date.parse("2026-07-30T12:00:00.000Z"),
+    ),
+    true,
+  );
+  assert.equal(
+    monitorHasLivePath(
+      { monitorLastTriggeredAt: "2026-07-30T12:00:00.000Z" },
+      [],
+      Date.parse("2026-07-30T12:05:00.000Z"),
+    ),
+    true,
+  );
+  assert.equal(
+    monitorHasLivePath(
+      { monitorLastTriggeredAt: "2026-07-30T12:00:00.000Z" },
+      [],
+      Date.parse("2026-07-30T12:11:00.000Z"),
+    ),
+    false,
+  );
+  assert.equal(
+    monitorHasLivePath(
+      { monitorNextCheckAt: "2026-07-30T11:59:00.000Z" },
+      [],
+      Date.parse("2026-07-30T12:00:00.000Z"),
+    ),
+    false,
+  );
+});
+
+test("near-miss rejection headlines are routed instead of disappearing", () => {
+  const issue = {
+    id: "linear-variant",
+    identifier: "KSNV-190",
+    comments: {
+      nodes: [
+        {
+          id: "33333333-3333-4333-8333-333333333333",
+          body: structuredRejection.replace(
+            "## QA REJECTED",
+            "## QA REJECTED (cycle 2)",
+          ),
+          createdAt: "2026-07-30T10:00:00.000Z",
+        },
+      ],
+    },
+  };
+  assert.equal(extractUnresolvedRejections([issue]).length, 1);
+});
+
+test("rejection evidence requires one non-empty literal label per field", () => {
+  const prose =
+    "QA REJECTED\nExpected behavior was not observed in the environment; severity is P1.";
+  assert.equal(rejectionCompleteness(prose).complete, false);
+  const duplicate = `${structuredRejection}\n- Severity: P2`;
+  assert.deepEqual(rejectionCompleteness(duplicate).duplicates, ["severity"]);
+});
+
+test("rejection observations retain the exact resolving return", () => {
+  const rejectionId = "44444444-4444-4444-8444-444444444444";
+  const returnId = "55555555-5555-4555-8555-555555555555";
+  const observations = extractRejectionObservations([
+    {
+      id: "linear-resolved",
+      comments: {
+        nodes: [
+          {
+            id: rejectionId,
+            body: structuredRejection,
+            createdAt: "2026-07-30T10:00:00.000Z",
+          },
+          {
+            id: returnId,
+            body: `QA RETURN RESOLVED\n\nRejection: ${rejectionId}`,
+            createdAt: "2026-07-30T11:00:00.000Z",
+          },
+        ],
+      },
+    },
+  ]);
+  assert.equal(observations[0].resolved, true);
+  assert.equal(observations[0].resolutionCommentId, returnId);
+});
+
+test("stage dispatch keys are stable across mutable Linear updates", () => {
+  assert.equal(
+    stageDispatchKey("linear-1", "ready_for_qa", 7),
+    "linear-stage:linear-1:ready_for_qa:entry-7",
+  );
+});
+
+test("source-bound titles preserve the Linear id and action within 240 chars", () => {
+  const title = boundedSourceTitle(
+    "KSNV-999",
+    "A".repeat(400),
+    "Delivery QA-return monitor",
+  );
+  assert.equal(title.length, 240);
+  assert.match(title, /^\[KSNV-999\] /);
+  assert.match(title, / — Delivery QA-return monitor$/);
+});
+
+test("version 4 state migration adds durable entry sequences", () => {
+  assert.deepEqual(
+    migrateLifecycleState(
+      {
+        version: 4,
+        active: {},
+        transitionHistory: {},
+        rejectionCycles: {},
+      },
+      "2026-07-30T12:00:00.000Z",
+    ),
+    {
+      version: 5,
+      active: {},
+      transitionHistory: {},
+      rejectionCycles: {},
+      migratedAt: "2026-07-30T12:00:00.000Z",
+      entrySequences: {},
+    },
+  );
+});
+
+test("legacy advancement-only rejection outcomes are re-verified", () => {
+  assert.deepEqual(
+    migrateLifecycleState(
+      {
+        version: 5,
+        rejectionCycles: {
+          "rejection-1": {
+            identifier: "KSNV-217",
+            status: "resolved_or_advanced",
+          },
+          "rejection-2": {
+            identifier: "KSNV-188",
+            status: "resolved_return_observed",
+          },
+        },
+      },
+      "2026-07-30T12:00:00.000Z",
+    ).rejectionCycles,
+    {
+      "rejection-1": {
+        identifier: "KSNV-217",
+        status: "unverified_legacy_resolution",
+        legacyResolutionInvalidatedAt: "2026-07-30T12:00:00.000Z",
+      },
+      "rejection-2": {
+        identifier: "KSNV-188",
+        status: "resolved_return_observed",
+      },
+    },
+  );
 });
 
 test("production approval is fail-closed unless artifact-bound", () => {

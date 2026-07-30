@@ -8,6 +8,16 @@ test -r /Volumes/OdessaExt/Kasanova/.worktrees/.toolchains/flutter/bin/cache/.pa
 dart_bin=/Volumes/OdessaExt/Kasanova/.worktrees/.toolchains/flutter/bin/cache/dart-sdk/bin/dart
 test -x "$dart_bin"
 test "$(od -An -t x1 -j18 -N2 "$dart_bin" | tr -d ' \n')" = b700
+watcher_health=/paperclip/instances/default/data/ksnvqa-rfqa-intake/health.json
+test -r "$watcher_health"
+node -e '
+  const fs = require("node:fs");
+  const health = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+  const lastPollMs = Date.parse(health.lastPollAt || "");
+  if (health.status !== "ok") process.exit(1);
+  if (!Number.isFinite(lastPollMs)) process.exit(1);
+  if (Date.now() - lastPollMs > 5 * 60 * 1000) process.exit(1);
+' "$watcher_health"
 test -r /odessa-root/USING_ANDROID_DEVICE.lock
 node -e '
   const fs = require("node:fs");
