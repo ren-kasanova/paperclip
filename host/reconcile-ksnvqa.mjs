@@ -169,10 +169,11 @@ await reconcileAgent(
     config.env.ODESSA_ANDROID_DEVICE_LOCK = plain(
       "/odessa-root/USING_ANDROID_DEVICE.lock",
     );
-    // Paperclip Landlock is the mandatory outer filesystem boundary. Keep the
-    // Codex bypass disabled unless Ren explicitly approves relying on that
-    // outer boundary in place of Codex's unavailable nested sandbox.
-    config.dangerouslyBypassApprovalsAndSandbox = false;
+    // Ren explicitly authorized Kasanova QA on 2026-07-30 to bypass Codex's
+    // unavailable nested sandbox/approval layer. Paperclip Landlock remains
+    // the mandatory filesystem boundary, and governed effects still route
+    // through Paperclip plus DECK·7.
+    config.dangerouslyBypassApprovalsAndSandbox = true;
     config.extraArgs = ["--skip-git-repo-check"];
     config.filesystemScope = "workspace";
     config.filesystemSandboxBackend = "landlock";

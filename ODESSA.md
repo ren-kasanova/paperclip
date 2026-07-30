@@ -48,9 +48,11 @@ unhealthy but permanently running container.
   mandatory Landlock boundary. Codex's Bubblewrap default requires a user
   namespace unavailable inside the Colima container, while Codex's legacy
   Landlock backend is incompatible with its managed direct-permission profile.
-  Do not enable the combined Codex sandbox/approval bypass without Ren's
-  explicit authorization. Until that decision is made, KSNVQA shell and MCP
-  execution remain fail-closed.
+  Ren explicitly authorized Kasanova QA on 2026-07-30 to use Codex's combined
+  sandbox/approval bypass and rely on the mandatory Paperclip Landlock
+  boundary. This removes nested noninteractive prompts; it does not expand the
+  mounted filesystem policy, grant browser access, or bypass Paperclip and
+  DECK·7 governance for state-changing or production effects.
 
 ## Board decision routing
 

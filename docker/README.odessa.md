@@ -33,13 +33,14 @@ in `ODESSA.md`. Provision them with
 `host/provision-kasanova-dart-sdk.sh`; never install toolchains or
 `node_modules` at the OdessaExt root.
 
-KSNVQA Codex runs use Paperclip's Landlock wrapper as the filesystem sandbox
-and keep Codex's combined sandbox/approval bypass disabled. The Bubblewrap
-default cannot create its user namespace in Colima, and Codex's legacy
-Landlock backend cannot enforce the managed direct-permission profile. KSNVQA
-therefore remains fail-closed until Ren explicitly authorizes relying on the
-outer Landlock boundary; real governed effects still route through Paperclip
-interactions and DECK·7.
+KSNVQA Codex runs use Paperclip's Landlock wrapper as the mandatory filesystem
+sandbox. The Bubblewrap default cannot create its user namespace in Colima,
+and Codex's legacy Landlock backend cannot enforce the managed direct-permission
+profile. Ren explicitly authorized Kasanova QA on 2026-07-30 to use Codex's
+combined sandbox/approval bypass and rely on the outer Landlock boundary. This
+removes nested noninteractive prompts only; real governed effects still route
+through Paperclip interactions and DECK·7, and browser access remains
+separately prohibited.
 
 On a brand-new watcher state, currently active non-`Done` lifecycle stages are
 dispatched immediately. `Done` is baselined without replay. A migrated watcher
