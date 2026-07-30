@@ -136,6 +136,62 @@ export function monitorHasLivePath(
   );
 }
 
+export function buildDeliveryMonitorPolicy(
+  issue,
+  rejectionCommentId,
+  {
+    nowMs = Date.now(),
+    delayMs = 30 * 60 * 1000,
+    timeoutAt = null,
+    returnTimeoutMs = 72 * 60 * 60 * 1000,
+  } = {},
+) {
+  const existingPolicy = issue?.executionPolicy || {};
+  const existingMonitor = existingPolicy.monitor || {};
+  const linearIdentifier =
+    typeof issue?.title === "string"
+      ? issue.title.match(/^\[(KSNV-\d+)\]/)?.[1]
+      : null;
+  return {
+    ...existingPolicy,
+    mode: existingPolicy.mode || "normal",
+    stages: Array.isArray(existingPolicy.stages)
+      ? existingPolicy.stages
+      : [],
+    monitor: {
+      ...existingMonitor,
+      kind: "external_service",
+      serviceName: "Kasanova QA lifecycle",
+      externalRef: [
+        linearIdentifier ? `linear:${linearIdentifier}` : null,
+        rejectionCommentId ? `linear-comment:${rejectionCommentId}` : null,
+        issue?.identifier ? `paperclip:${issue.identifier}` : null,
+      ].filter(Boolean).join("|"),
+      nextCheckAt: new Date(nowMs + delayMs).toISOString(),
+      timeoutAt:
+        timeoutAt ||
+        existingMonitor.timeoutAt ||
+        new Date(nowMs + returnTimeoutMs).toISOString(),
+      maxAttempts: 96,
+      recoveryPolicy: "wake_owner",
+      notes:
+        "Re-read the live Linear issue and immutable rejection, repair only delivery-owned work, post one QA RETURN RESOLVED citing the rejection ID, then return the same issue to Ready for QA.",
+    },
+    commentRequired:
+      typeof existingPolicy.commentRequired === "boolean"
+        ? existingPolicy.commentRequired
+        : true,
+  };
+}
+
+export function lifecycleHealthStatus(...failureGroups) {
+  return failureGroups.some(
+    (entries) => Array.isArray(entries) && entries.length > 0,
+  )
+    ? "degraded"
+    : "ok";
+}
+
 export function stageDispatchKey(issueId, stageSlug, entrySequence) {
   return `linear-stage:${issueId}:${stageSlug}:entry-${entrySequence}`;
 }
@@ -206,6 +262,7 @@ export function migrateLifecycleState(previous, now) {
     ...state,
     entrySequences: { ...(state.entrySequences || {}) },
     rejectionCycles,
+    returnDispatches: { ...(state.returnDispatches || {}) },
   };
 }
 
@@ -214,24 +271,53 @@ export function rejectionCycleMarker(commentId) {
 }
 
 export function isProductionPromotionInteraction(interaction) {
-  const text = [
+  const headline = [
     interaction?.title,
     interaction?.summary,
     interaction?.payload?.prompt,
   ]
     .filter(Boolean)
     .join(" ");
+  const details = String(interaction?.payload?.detailsMarkdown || "");
+  const explicitlyExcluded =
+    /\bproduction\s+(?:promotion|deployment|release|rollout)\s+(?:is\s+|are\s+)?(?:explicitly\s+)?excluded\b/i.test(
+      details,
+    ) ||
+    /\b(?:explicitly\s+)?exclude(?:s|d)?\s+production\s+(?:promotion|deployment|release|rollout)\b/i.test(
+      details,
+    );
+  if (explicitlyExcluded) return false;
+  const promotionHeadline = headline.replace(
+    /\b(?:lock transfer|lock release|ownership transfer)\b/gi,
+    "",
+  );
+  const productionEnvironment =
+    /\b(?:production|prod|live|play\s+store\s+production)\b/i;
+  const promotionAction =
+    /\b(?:promot(?:e|ing|ion)|release|deploy(?:ment|ing)?|rollout|ship)\b/i;
   return (
     interaction?.kind === "request_confirmation" &&
     (
-      /\bproduction\s+(?:promotion|deployment|release)\b/i.test(text) ||
-      /\bpromot(?:e|ing|ion)\b.{0,80}\b(?:to\s+)?production\b/i.test(text) ||
-      /\brelease\b.{0,80}\b(?:to\s+)?production\b/i.test(text)
+      /\bproduction\s+(?:promotion|deployment|release|rollout)\b/i.test(
+        promotionHeadline,
+      ) ||
+      (
+        promotionAction.test(promotionHeadline) &&
+        (productionEnvironment.test(promotionHeadline) ||
+          productionEnvironment.test(details))
+      ) ||
+      (
+        productionEnvironment.test(promotionHeadline) &&
+        promotionAction.test(details)
+      )
     )
   );
 }
 
-export function productionApprovalTargetViolation(interaction) {
+export function productionApprovalTargetViolation(
+  interaction,
+  expectedIdentifier = null,
+) {
   if (!isProductionPromotionInteraction(interaction)) return null;
   const target = interaction?.payload?.target;
   if (!target || target.type !== "custom") {
@@ -240,8 +326,17 @@ export function productionApprovalTargetViolation(interaction) {
   if (!String(target.revisionId || "").trim()) {
     return "Production promotion approvals must include the immutable artifact digest or release revision as target.revisionId.";
   }
-  if (!/^ksnv-\d+:production-promotion:/i.test(String(target.key || ""))) {
+  const keyMatch = String(target.key || "").match(
+    /^(ksnv-\d+):production-promotion:/i,
+  );
+  if (!keyMatch) {
     return "Production promotion approval target.key must be `KSNV-###:production-promotion:<release-path>`.";
+  }
+  if (
+    expectedIdentifier &&
+    keyMatch[1].toUpperCase() !== String(expectedIdentifier).toUpperCase()
+  ) {
+    return `Production promotion approval target.key must reference ${expectedIdentifier}.`;
   }
   const details = String(interaction?.payload?.detailsMarkdown || "");
   const requiredEvidence = [

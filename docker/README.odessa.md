@@ -33,6 +33,22 @@ return is an invariant violation, not implicit success. Legacy
 monitors can be reopened; `cancelled` monitors fail closed and are reported as
 source-bound invariant work.
 
+Each rejection cycle receives one durable 72-hour return deadline derived from
+its first detection time. Repairs preserve that deadline and the monitor's
+complete execution policy, including review and authorization settings. An
+unresolved cycle that reaches the deadline or exhausts its bounded attempts
+stops re-arming and creates source-bound invariant work. The regular one-hour
+return cadence cannot exhaust 96 attempts before the 72-hour deadline. Legacy
+monitors missing from the ledger use their persisted monitor deadline and
+surface equivalent invariant work.
+
+When Linear records the exact cited `QA RETURN RESOLVED`, the watcher closes
+the corresponding Delivery monitor, clears its execution policy, and removes
+the Delivery assignee so comments cannot wake obsolete work. Malformed
+rejection evidence always has a durable destination: an open source task gets
+one marker-guarded warning, otherwise the watcher creates one source-bound QA
+evidence-repair task.
+
 An existing future monitor deadline, active execution, recent wake/trigger, or
 pending interaction is a live delivery path. The minute watcher does not
 rewrite a live deadline, which prevents a frequent poll from postponing the
@@ -85,6 +101,18 @@ entries into the same stage within 24 hours and leaves a durable Paperclip
 comment for the responsible agent when the guard fires.
 
 The container healthcheck requires the watcher health record to remain `ok`
-and less than five minutes old. `host/reconcile-ksnvqa.mjs --check` audits the
-agent runtime, routine titles and variables, the `0 */8 * * *`
-`America/Monterrey` fallback trigger, and source-bound Paperclip titles.
+and less than five minutes old. Any stage dispatch failure, lifecycle-guard
+delivery failure, or monitor/rejection invariant violation changes watcher
+health to `degraded`; stderr alone is never treated as a successful poll.
+Compose allows a 90-second healthcheck start period for the first heartbeat.
+
+Paperclip issue and comment reads are fully paginated. Routine-execution rows
+are excluded from the minute watcher scan so historical fallback runs cannot
+push an idle Delivery monitor out of view. `host/reconcile-ksnvqa.mjs --check`
+audits all pages of the project, the five-minute intake runtime, routine titles
+and variables, the `0 */8 * * *` `America/Monterrey` fallback trigger, and
+source-bound Paperclip titles.
+
+Watcher `degraded` means the poll completed but lifecycle work needs attention;
+the healthcheck accepts it as a live control plane. Only `error`, an invalid
+record, or a stale poll marks the Paperclip container unhealthy.

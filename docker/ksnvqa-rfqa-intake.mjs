@@ -11,10 +11,13 @@ import { randomUUID } from "node:crypto";
 import path from "node:path";
 
 import {
+  buildDeliveryMonitorPolicy,
   boundedSourceTitle,
   deliveryMonitorCandidates,
   extractRejectionObservations,
   extractUnresolvedRejections,
+  isProductionPromotionInteraction,
+  lifecycleHealthStatus,
   migrateLifecycleState,
   monitorHasLivePath,
   productionApprovalTargetViolation,
@@ -61,6 +64,8 @@ const config = {
   cycleWindowMs: Number(process.env.LIFECYCLE_CYCLE_WINDOW_HOURS || 24) * 60 * 60 * 1000,
   maxStageEntries: Number(process.env.LIFECYCLE_MAX_STAGE_ENTRIES || 3),
   requestTimeoutMs: Number(process.env.LIFECYCLE_REQUEST_TIMEOUT_MS || 10_000),
+  returnTimeoutMs:
+    Number(process.env.LIFECYCLE_RETURN_TIMEOUT_HOURS || 72) * 60 * 60 * 1000,
 };
 
 const stages = [
@@ -155,12 +160,22 @@ async function acquireLock() {
 async function releaseLock(handle) {
   if (!handle) return;
   clearInterval(handle.heartbeat);
-  await handle.handle.close();
+  try {
+    await handle.handle.close();
+  } catch {
+    return;
+  }
   try {
     const current = await readJson(lockFile, null);
     if (current?.token === handle.token) await unlink(lockFile);
   } catch (error) {
-    if (error?.code !== "ENOENT") throw error;
+    if (error?.code !== "ENOENT") {
+      process.stderr.write(
+        `${new Date().toISOString()} lifecycle lock release warning: ${
+          error instanceof Error ? error.message : String(error)
+        }\n`,
+      );
+    }
   }
 }
 
@@ -365,11 +380,27 @@ async function dispatchIssue(issue, entrySequence) {
 }
 
 async function fetchPaperclipIssues() {
-  const issues = await fetchJson(
-    `${config.paperclipApiUrl}/companies/${config.companyId}/issues`,
-  );
-  if (!Array.isArray(issues)) {
-    throw new Error("Paperclip company issues endpoint returned an invalid response");
+  const issues = [];
+  const limit = 1000;
+  let offset = 0;
+  while (true) {
+    const query = new URLSearchParams({
+      limit: String(limit),
+      offset: String(offset),
+      excludeRoutineExecutions: "true",
+      projectId: config.projectId,
+    });
+    const page = await fetchJson(
+      `${config.paperclipApiUrl}/companies/${config.companyId}/issues?${query}`,
+    );
+    if (!Array.isArray(page)) {
+      throw new Error(
+        "Paperclip company issues endpoint returned an invalid response",
+      );
+    }
+    issues.push(...page);
+    if (page.length < limit) break;
+    offset += page.length;
   }
   return issues;
 }
@@ -387,11 +418,31 @@ async function postIssueComment(issueId, body) {
 }
 
 async function fetchIssueComments(issueId) {
-  const comments = await fetchJson(
-    `${config.paperclipApiUrl}/issues/${issueId}/comments?order=desc&limit=100`,
-  );
-  if (!Array.isArray(comments)) {
-    throw new Error(`Paperclip comments endpoint returned an invalid response for ${issueId}`);
+  const comments = [];
+  const limit = 500;
+  let after = null;
+  while (true) {
+    const query = new URLSearchParams({
+      order: "desc",
+      limit: String(limit),
+      ...(after ? { after } : {}),
+    });
+    const page = await fetchJson(
+      `${config.paperclipApiUrl}/issues/${issueId}/comments?${query}`,
+    );
+    if (!Array.isArray(page)) {
+      throw new Error(
+        `Paperclip comments endpoint returned an invalid response for ${issueId}`,
+      );
+    }
+    comments.push(...page);
+    if (page.length < limit) break;
+    after = page.at(-1)?.id || null;
+    if (!after) {
+      throw new Error(
+        `Paperclip comments endpoint did not provide a cursor for ${issueId}`,
+      );
+    }
   }
   return comments;
 }
@@ -434,35 +485,17 @@ async function createPaperclipIssue(body) {
   );
 }
 
-function monitorPolicy(issue, rejectionCommentId, delayMs = 30 * 60 * 1000) {
-  const nextCheckAt = new Date(Date.now() + delayMs);
-  const timeoutAt = new Date(Date.now() + 72 * 60 * 60 * 1000);
-  const linearIdentifier =
-    typeof issue.title === "string"
-      ? issue.title.match(/^\[(KSNV-\d+)\]/)?.[1]
-      : null;
-  return {
-    mode: issue.executionPolicy?.mode || "normal",
-    stages: Array.isArray(issue.executionPolicy?.stages)
-      ? issue.executionPolicy.stages
-      : [],
-    monitor: {
-      kind: "external_service",
-      serviceName: "Kasanova QA lifecycle",
-      externalRef: [
-        linearIdentifier ? `linear:${linearIdentifier}` : null,
-        rejectionCommentId ? `linear-comment:${rejectionCommentId}` : null,
-        `paperclip:${issue.identifier}`,
-      ].filter(Boolean).join("|"),
-      nextCheckAt: nextCheckAt.toISOString(),
-      timeoutAt: timeoutAt.toISOString(),
-      maxAttempts: 96,
-      recoveryPolicy: "wake_owner",
-      notes:
-        "Re-read the live Linear issue and immutable rejection, repair only delivery-owned work, post one QA RETURN RESOLVED citing the rejection ID, then return the same issue to Ready for QA.",
-    },
-    commentRequired: true,
-  };
+function monitorPolicy(
+  issue,
+  rejectionCommentId,
+  delayMs = 60 * 60 * 1000,
+  timeoutAt = null,
+) {
+  return buildDeliveryMonitorPolicy(issue, rejectionCommentId, {
+    delayMs,
+    timeoutAt,
+    returnTimeoutMs: config.returnTimeoutMs,
+  });
 }
 
 function latestSourceBoundIssue(paperclipIssues, identifier) {
@@ -472,7 +505,10 @@ function latestSourceBoundIssue(paperclipIssues, identifier) {
       (issue) =>
         typeof issue?.title === "string" &&
         issue.title.startsWith(prefix) &&
-        !issue.title.endsWith("— Delivery QA-return monitor"),
+        !issue.title.endsWith("— Delivery QA-return monitor") &&
+        !issue.title.includes("— lifecycle invariant:") &&
+        !issue.title.endsWith("— lifecycle churn guard") &&
+        !issue.title.endsWith("— rejection evidence repair"),
     )
     .sort((left, right) =>
       String(right.updatedAt || "").localeCompare(String(left.updatedAt || "")),
@@ -541,6 +577,85 @@ async function surfaceLifecycleInvariant({
   return created;
 }
 
+async function surfaceRejectionEvidenceIssue({
+  linearIssue,
+  paperclipIssues,
+  rejectionCommentId,
+  reason,
+}) {
+  const parent = latestSourceBoundIssue(
+    paperclipIssues,
+    linearIssue.identifier,
+  );
+  const created = await createPaperclipIssue({
+    projectId: config.projectId,
+    projectWorkspaceId: config.projectWorkspaceId,
+    parentId: parent?.id || null,
+    title: boundedSourceTitle(
+      linearIssue.identifier,
+      linearIssue.title,
+      "rejection evidence repair",
+    ),
+    description: [
+      `Repair the existing malformed QA rejection for [${linearIssue.identifier}](${linearIssue.url}).`,
+      "",
+      `- Immutable rejection comment: \`${rejectionCommentId}\``,
+      `- Evidence defect: ${reason}`,
+      "- Edit the original Linear comment to contain exactly one non-empty required label. Do not create a second rejection.",
+    ].join("\n"),
+    status: "todo",
+    priority: "high",
+    assigneeAgentId: config.assigneeAgentId,
+    assigneeUserId: null,
+    idempotencyKey:
+      `ksnvqa-rejection-evidence:${linearIssue.id}:${rejectionCommentId}`,
+  });
+  paperclipIssues.push(created);
+  return created;
+}
+
+async function surfaceMonitorInvariant({
+  monitor,
+  paperclipIssues,
+  kind,
+  reason,
+  rejectionCommentId,
+}) {
+  const identifier =
+    String(monitor.title || "").match(/^\[(KSNV-\d+)\]/)?.[1] ||
+    "LINEAR-SWEEP";
+  const subject = String(monitor.title || monitor.identifier)
+    .replace(/^\[[^\]]+\]\s*/, "")
+    .replace(/\s+— Delivery QA-return monitor$/, "");
+  const created = await createPaperclipIssue({
+    projectId: config.projectId,
+    projectWorkspaceId: config.projectWorkspaceId,
+    parentId: monitor.id,
+    title: boundedSourceTitle(
+      identifier,
+      subject,
+      `lifecycle invariant: ${kind}`,
+    ),
+    description: [
+      `The Delivery monitor ${monitor.identifier} stopped fail-closed.`,
+      "",
+      `- Invariant: ${reason}`,
+      rejectionCommentId
+        ? `- Immutable rejection comment: \`${rejectionCommentId}\``
+        : "- Immutable rejection comment: unavailable in the watcher ledger",
+      "- Required action: reconcile the Linear rejection cycle before reactivating Delivery.",
+    ].join("\n"),
+    status: "todo",
+    priority: "high",
+    assigneeAgentId: null,
+    assigneeUserId: "local-board",
+    idempotencyKey:
+      `ksnvqa-monitor-invariant:${monitor.id}:${kind}`,
+  });
+  paperclipIssues.push(created);
+  return created;
+}
+
 async function enforceRejectionCycles(
   inProgressIssues,
   lifecycleIssues,
@@ -571,12 +686,21 @@ async function enforceRejectionCycles(
     const { issue: linearIssue, comment, completeness } = rejection;
     const marker = rejectionCycleMarker(comment.id);
     const evidenceMarker = `KSNVQA rejection evidence warning: ${comment.id}`;
+    const detectedAt =
+      cycles[comment.id]?.detectedAt || new Date().toISOString();
+    const storedTimeoutMs = Date.parse(cycles[comment.id]?.timeoutAt || "");
+    const timeoutAt = Number.isFinite(storedTimeoutMs)
+      ? new Date(storedTimeoutMs).toISOString()
+      : new Date(
+          Date.parse(detectedAt) + config.returnTimeoutMs,
+        ).toISOString();
     const cycle = {
       ...(cycles[comment.id] || {}),
       linearIssueId: linearIssue.id,
       identifier: linearIssue.identifier,
       rejectionCommentId: comment.id,
-      detectedAt: cycles[comment.id]?.detectedAt || new Date().toISOString(),
+      detectedAt,
+      timeoutAt,
       lastSeenAt: new Date().toISOString(),
     };
 
@@ -611,11 +735,42 @@ async function enforceRejectionCycles(
             "The immutable rejection is still routed so delivery cannot be stranded. Kasanova QA must repair the existing Linear rejection comment; it must not create a duplicate rejection.",
           ].join("\n"),
         );
+      } else if (!cycle.evidenceIssueId) {
+        const evidenceIssue = await surfaceRejectionEvidenceIssue({
+          linearIssue,
+          paperclipIssues,
+          rejectionCommentId: comment.id,
+          reason,
+        });
+        cycle.evidenceIssueId = evidenceIssue.id;
+        cycle.evidenceIdentifier = evidenceIssue.identifier;
       }
     } else {
       delete cycle.evidenceWarning;
       delete cycle.missingFields;
       delete cycle.duplicateFields;
+    }
+
+    if (Date.now() >= Date.parse(cycle.timeoutAt)) {
+      const reason =
+        `${linearIssue.identifier} rejection ${comment.id} exceeded its ` +
+        `${config.returnTimeoutMs / (60 * 60 * 1000)}-hour Delivery return window`;
+      violations.push(reason);
+      cycle.status = "blocked_return_timeout";
+      cycle.invariantViolation = reason;
+      if (!cycle.timeoutInvariantIssueId) {
+        const invariant = await surfaceLifecycleInvariant({
+          linearIssue,
+          paperclipIssues,
+          rejectionCommentId: comment.id,
+          kind: "return-timeout",
+          reason,
+        });
+        cycle.timeoutInvariantIssueId = invariant.id;
+        cycle.timeoutInvariantIdentifier = invariant.identifier;
+      }
+      cycles[comment.id] = cycle;
+      continue;
     }
 
     let candidates = deliveryMonitorCandidates(
@@ -691,7 +846,44 @@ async function enforceRejectionCycles(
       continue;
     }
 
-    const policy = monitorPolicy(monitor, comment.id);
+    const detailedMonitor = await fetchPaperclipIssue(monitor.id);
+    const policy = monitorPolicy(
+      detailedMonitor,
+      comment.id,
+      60 * 60 * 1000,
+      cycle.timeoutAt,
+    );
+    const attemptCount =
+      detailedMonitor.executionState?.monitor?.attemptCount || 0;
+    const maxAttempts =
+      detailedMonitor.executionPolicy?.monitor?.maxAttempts || 96;
+    if (attemptCount >= maxAttempts) {
+      const reason =
+        `${linearIssue.identifier} rejection ${comment.id} exhausted ` +
+        `${attemptCount}/${maxAttempts} Delivery monitor attempts`;
+      violations.push(reason);
+      cycle.status = "blocked_return_attempts";
+      cycle.invariantViolation = reason;
+      if (!cycle.attemptInvariantIssueId) {
+        const invariant = await surfaceLifecycleInvariant({
+          linearIssue,
+          paperclipIssues,
+          rejectionCommentId: comment.id,
+          kind: "return-attempts-exhausted",
+          reason,
+        });
+        cycle.attemptInvariantIssueId = invariant.id;
+        cycle.attemptInvariantIdentifier = invariant.identifier;
+      }
+      await patchIssue(monitor.id, {
+        status: "blocked",
+        assigneeAgentId: null,
+        assigneeUserId: null,
+        executionPolicy: null,
+      });
+      cycles[comment.id] = cycle;
+      continue;
+    }
     await patchIssue(monitor.id, {
       status: "in_review",
       assigneeAgentId: config.deliveryAgentId,
@@ -775,17 +967,14 @@ async function enforceRejectionCycles(
 }
 
 async function reportCycleGuard(issue, paperclipIssues, count) {
-  const prefix = `[${issue.identifier}]`;
-  const candidates = paperclipIssues
-    .filter((entry) =>
-      typeof entry?.title === "string" &&
-      entry.title.startsWith(prefix) &&
-      !["done", "cancelled"].includes(entry.status),
-    )
-    .sort((left, right) =>
-      String(right.updatedAt || "").localeCompare(String(left.updatedAt || "")),
-    );
-  const target = candidates[0];
+  const candidate = latestSourceBoundIssue(
+    paperclipIssues,
+    issue.identifier,
+  );
+  const target =
+    candidate && !["done", "cancelled"].includes(candidate.status)
+      ? candidate
+      : null;
   if (!target?.id) {
     const created = await createPaperclipIssue({
       projectId: config.projectId,
@@ -835,34 +1024,178 @@ async function reportCycleGuard(issue, paperclipIssues, count) {
   };
 }
 
-async function enforceDeliveryMonitorInvariant(paperclipIssues, previousNotifications) {
-  const notifications = { ...(previousNotifications || {}) };
+async function enforceDeliveryMonitorInvariant(
+  paperclipIssues,
+  previousNotifications,
+  rejectionCycles = {},
+) {
+  const issueIds = new Set(paperclipIssues.map((issue) => issue.id));
+  const notifications = Object.fromEntries(
+    Object.entries(previousNotifications || {}).filter(([issueId]) =>
+      issueIds.has(issueId),
+    ),
+  );
   const violations = [];
   const repaired = [];
+  const closed = [];
+  const stopped = [];
+  const cycleByMonitorIssueId = new Map(
+    Object.values(rejectionCycles || {})
+      .filter((cycle) => cycle?.monitorIssueId)
+      .map((cycle) => [cycle.monitorIssueId, cycle]),
+  );
   for (const issue of paperclipIssues) {
     const isMonitor =
       typeof issue?.title === "string" &&
       issue.title.endsWith("— Delivery QA-return monitor");
     const eligibleStatus = ["in_progress", "in_review"].includes(issue?.status);
-    if (!isMonitor || !eligibleStatus) continue;
+    const knownCycle = cycleByMonitorIssueId.get(issue.id) || null;
+    const terminalKnownCycle =
+      String(knownCycle?.status || "").startsWith("resolved_") ||
+      String(knownCycle?.status || "").startsWith("closed_");
+    const terminalCleanup =
+      (issue.status === "done" && issue.assigneeAgentId != null) ||
+      (terminalKnownCycle && !eligibleStatus);
+    if (!isMonitor || (!eligibleStatus && !terminalCleanup)) continue;
 
-    const interactions = await fetchIssueInteractions(issue.id);
-    const ownerDrift =
-      issue.assigneeAgentId !== config.deliveryAgentId ||
-      issue.assigneeUserId != null;
-    if (!ownerDrift && monitorHasLivePath(issue, interactions)) {
-      delete notifications[issue.id];
-      continue;
-    }
     try {
       const detailedIssue = await fetchPaperclipIssue(issue.id);
+      const cycle = knownCycle;
       const rejectionCommentId =
+        cycle?.rejectionCommentId ||
         String(detailedIssue.executionPolicy?.monitor?.externalRef || "")
-          .match(/(?:^|\|)linear-comment:([^|]+)/)?.[1] || null;
+          .match(/(?:^|\|)linear-comment:([^|]+)/)?.[1] ||
+        null;
+      const cycleStatus = String(cycle?.status || "");
+      if (
+        cycleStatus.startsWith("resolved_") ||
+        cycleStatus.startsWith("closed_") ||
+        detailedIssue.status === "done"
+      ) {
+        if (cycle) {
+          await ensureIssueComment(
+            issue.id,
+            `KSNVQA monitor closed: ${rejectionCommentId || issue.id}`,
+            [
+              "## Delivery monitor closed",
+              "",
+              `KSNVQA monitor closed: ${rejectionCommentId || issue.id}`,
+              "",
+              rejectionCommentId
+                ? `Linear recorded an exact \`QA RETURN RESOLVED\` for rejection \`${rejectionCommentId}\`.`
+                : "The tracked Linear cycle reached a terminal state.",
+              "No further Delivery wake is required for this rejection cycle.",
+            ].join("\n"),
+          );
+        }
+        await patchIssue(issue.id, {
+          status: "done",
+          assigneeAgentId: null,
+          assigneeUserId: null,
+          executionPolicy: null,
+        });
+        delete notifications[issue.id];
+        closed.push(issue.identifier);
+        continue;
+      }
+      const monitorState = detailedIssue.executionState?.monitor || {};
+      const persistedMonitor =
+        detailedIssue.executionPolicy?.monitor || {};
+      const attemptCount = Number(monitorState.attemptCount || 0);
+      const maxAttempts = Number(
+        monitorState.maxAttempts || persistedMonitor.maxAttempts || 96,
+      );
+      const durableTimeoutAt =
+        cycle?.timeoutAt ||
+        monitorState.timeoutAt ||
+        persistedMonitor.timeoutAt ||
+        null;
+      const timedOut =
+        cycleStatus === "blocked_return_timeout" ||
+        (durableTimeoutAt &&
+          Date.now() >= Date.parse(durableTimeoutAt));
+      const attemptsExhausted =
+        cycleStatus === "blocked_return_attempts" ||
+        attemptCount >= maxAttempts;
+      if (timedOut || attemptsExhausted) {
+        const kind = timedOut
+          ? "return-timeout"
+          : "return-attempts-exhausted";
+        const reason = timedOut
+          ? `${issue.identifier} exceeded its durable Delivery return deadline ${durableTimeoutAt}`
+          : `${issue.identifier} exhausted ${attemptCount}/${maxAttempts} Delivery monitor attempts`;
+        if (cycle) {
+          cycle.status = timedOut
+            ? "blocked_return_timeout"
+            : "blocked_return_attempts";
+          cycle.invariantViolation = reason;
+        }
+        const existingInvariantId = timedOut
+          ? cycle?.timeoutInvariantIssueId
+          : cycle?.attemptInvariantIssueId;
+        if (!existingInvariantId) {
+          const invariant = await surfaceMonitorInvariant({
+            monitor: detailedIssue,
+            paperclipIssues,
+            kind,
+            reason,
+            rejectionCommentId,
+          });
+          if (cycle) {
+            if (timedOut) {
+              cycle.timeoutInvariantIssueId = invariant.id;
+              cycle.timeoutInvariantIdentifier = invariant.identifier;
+            } else {
+              cycle.attemptInvariantIssueId = invariant.id;
+              cycle.attemptInvariantIdentifier = invariant.identifier;
+            }
+          }
+        }
+        await ensureIssueComment(
+          issue.id,
+          `KSNVQA monitor stopped: ${kind}`,
+          [
+            "## Delivery monitor stopped fail-closed",
+            "",
+            `KSNVQA monitor stopped: ${kind}`,
+            "",
+            reason,
+            "A source-bound invariant task now owns recovery; this monitor will not re-arm automatically.",
+          ].join("\n"),
+        );
+        await patchIssue(issue.id, {
+          status: "blocked",
+          assigneeAgentId: null,
+          assigneeUserId: null,
+          executionPolicy: null,
+        });
+        delete notifications[issue.id];
+        stopped.push(issue.identifier);
+        violations.push(reason);
+        continue;
+      }
+      const interactions = await fetchIssueInteractions(issue.id);
+      const ownerDrift =
+        detailedIssue.assigneeAgentId !== config.deliveryAgentId ||
+        detailedIssue.assigneeUserId != null;
+      if (
+        !ownerDrift &&
+        monitorHasLivePath(detailedIssue, interactions)
+      ) {
+        delete notifications[issue.id];
+        continue;
+      }
+      if (
+        detailedIssue.status !== "in_progress" &&
+        detailedIssue.status !== "in_review"
+      ) {
+        continue;
+      }
       const executionPolicy = monitorPolicy(
         detailedIssue,
         rejectionCommentId,
         2 * 60 * 60 * 1000,
+        durableTimeoutAt,
       );
       await patchIssue(issue.id, {
         assigneeAgentId: config.deliveryAgentId,
@@ -871,10 +1204,16 @@ async function enforceDeliveryMonitorInvariant(paperclipIssues, previousNotifica
       });
       repaired.push(issue.identifier);
       if (notifications[issue.id]) continue;
-      await postIssueComment(
+      const marker = `KSNVQA monitor repair: ${
+        rejectionCommentId || issue.id
+      }`;
+      await ensureIssueComment(
         issue.id,
+        marker,
         [
           "## Delivery monitor invariant repaired",
+          "",
+          marker,
           "",
           "The zero-token Kasanova lifecycle watcher restored this active QA-return monitor's persisted wake path.",
           "",
@@ -893,7 +1232,36 @@ async function enforceDeliveryMonitorInvariant(paperclipIssues, previousNotifica
       );
     }
   }
-  return { notifications, violations, repaired };
+  return { notifications, violations, repaired, closed, stopped };
+}
+
+function absoluteConfirmationReason(interaction) {
+  const text = [
+    interaction?.title,
+    interaction?.summary,
+    interaction?.payload?.prompt,
+    interaction?.payload?.detailsMarkdown,
+  ]
+    .filter(Boolean)
+    .join(" ");
+  return /\bbrowser\b/i.test(text)
+    ? "Browser access cannot be granted through a Paperclip interaction."
+    : null;
+}
+
+function realProvisioningRequest(interaction) {
+  if (isProductionPromotionInteraction(interaction)) return false;
+  const headline = [
+    interaction?.title,
+    interaction?.summary,
+    interaction?.payload?.prompt,
+    interaction?.payload?.detailsMarkdown,
+  ]
+    .filter(Boolean)
+    .join(" ");
+  return /\b(provision(?:ed|ing)?|credential|funded|fixture|lock transfer|lock release|ownership transfer)\b/i.test(
+    headline,
+  );
 }
 
 function forbiddenConfirmationReason(interaction) {
@@ -908,9 +1276,8 @@ function forbiddenConfirmationReason(interaction) {
   const authorization =
     /\b(authori[sz]e|permission|approve|allow|confirm)\b/i.test(headline);
   if (!authorization) return null;
-  if (/\bbrowser\b/i.test(`${headline} ${details}`)) {
-    return "Browser access cannot be granted through a Paperclip interaction.";
-  }
+  const absoluteReason = absoluteConfirmationReason(interaction);
+  if (absoluteReason) return absoluteReason;
   const toolMethod = String(
     interaction?.payload?.toolAction?.method ||
       interaction?.payload?.toolAction?.httpMethod ||
@@ -928,10 +1295,7 @@ function forbiddenConfirmationReason(interaction) {
   const deviceUse =
     /\b(Android|emulator|device|ADB|TN10)\b/i.test(headline) &&
     /\b(use|access|run|test|QA)\b/i.test(headline);
-  const realProvisioning =
-    /\b(provision|credential|funded|fixture|lock transfer|lock release|ownership transfer)\b/i.test(
-      `${headline} ${details}`,
-    );
+  const realProvisioning = realProvisioningRequest(interaction);
   if (deviceUse && !realProvisioning) {
     return "Assigned Android-device and emulator use is preauthorized.";
   }
@@ -939,11 +1303,17 @@ function forbiddenConfirmationReason(interaction) {
 }
 
 async function enforceInteractionPolicy(previousHandled) {
-  const handled = { ...(previousHandled || {}) };
+  const handled = Object.fromEntries(
+    Object.entries(previousHandled || {}).filter(
+      ([, timestamp]) =>
+        Date.now() - Date.parse(timestamp) < 30 * 24 * 60 * 60 * 1000,
+    ),
+  );
   const feed = await fetchJson(
-    `${config.paperclipApiUrl}/companies/${config.companyId}/attention`,
+    `${config.paperclipApiUrl}/companies/${config.companyId}/attention?includeDismissed=true`,
   );
   const items = Array.isArray(feed?.items) ? feed.items : [];
+  const issueCache = new Map();
   let withdrawn = 0;
   for (const item of items) {
     if (item?.sourceKind !== "issue_thread_interaction") continue;
@@ -958,8 +1328,36 @@ async function enforceInteractionPolicy(previousHandled) {
       ? interactions.find((entry) => entry?.id === interactionId)
       : null;
     if (!interaction || interaction.status !== "pending") continue;
-    const productionViolation = productionApprovalTargetViolation(interaction);
-    const reason = forbiddenConfirmationReason(interaction) || productionViolation;
+    const productionPromotion =
+      isProductionPromotionInteraction(interaction) &&
+      !realProvisioningRequest(interaction);
+    const absoluteReason = absoluteConfirmationReason(interaction);
+    const preauthorizationReason =
+      forbiddenConfirmationReason(interaction);
+    let productionViolation = null;
+    let reason = null;
+    if (productionPromotion) {
+      let issue = issueCache.get(issueId);
+      if (!issue) {
+        issue = await fetchPaperclipIssue(issueId);
+        issueCache.set(issueId, issue);
+      }
+      const expectedIdentifier =
+        String(issue?.title || "").match(/^\[(KSNV-\d+)\]/)?.[1] || null;
+      productionViolation = productionApprovalTargetViolation(
+        interaction,
+        expectedIdentifier,
+      );
+      const readOnlyPreauthorization =
+        preauthorizationReason ===
+        "Read-only operations are preauthorized and cannot request approval.";
+      reason =
+        absoluteReason ||
+        (readOnlyPreauthorization ? preauthorizationReason : null) ||
+        productionViolation;
+    } else {
+      reason = preauthorizationReason;
+    }
     if (!reason) continue;
     await fetchJson(
       `${config.paperclipApiUrl}/issues/${issueId}/interactions/${interactionId}/reject`,
@@ -969,7 +1367,12 @@ async function enforceInteractionPolicy(previousHandled) {
         body: JSON.stringify({ reason }),
       },
     );
-    const remediation = productionViolation
+    const remediation = absoluteReason
+      ? [
+          "- Do not continue the browser operation.",
+          "- Browser access requires Ren's exact phrase `USA EL NAVEGADOR` in the current message; a Paperclip interaction cannot substitute for it.",
+        ]
+      : productionViolation && reason === productionViolation
       ? [
           "- Re-read the live `Ready for Release` state and QA evidence.",
           "- Create a new confirmation whose custom target binds the exact artifact/release revision.",
@@ -1010,6 +1413,33 @@ function pruneHistory(history, nowMs) {
   return next;
 }
 
+function pruneRejectionCycles(cycles, nowMs) {
+  const retentionMs = 30 * 24 * 60 * 60 * 1000;
+  return Object.fromEntries(
+    Object.entries(cycles || {}).filter(([, cycle]) => {
+      const terminal =
+        String(cycle?.status || "").startsWith("resolved_") ||
+        String(cycle?.status || "").startsWith("closed_");
+      if (!terminal) return true;
+      const resolvedMs = Date.parse(cycle?.resolvedAt || "");
+      return !Number.isFinite(resolvedMs) || nowMs - resolvedMs < retentionMs;
+    }),
+  );
+}
+
+function pruneReturnDispatches(dispatches, nowMs) {
+  const retentionMs = 30 * 24 * 60 * 60 * 1000;
+  return Object.fromEntries(
+    Object.entries(dispatches || {}).filter(([, dispatch]) => {
+      const dispatchedMs = Date.parse(dispatch?.dispatchedAt || "");
+      return (
+        !Number.isFinite(dispatchedMs) ||
+        nowMs - dispatchedMs < retentionMs
+      );
+    }),
+  );
+}
+
 function countByState(issues) {
   return Object.fromEntries(
     stages.map((stage) => [
@@ -1022,10 +1452,23 @@ function countByState(issues) {
 async function pollLifecycle() {
   const now = new Date().toISOString();
   const nowMs = new Date(now).getTime();
-  const previous = migrateLifecycleState(
+  const migratedState = migrateLifecycleState(
     await readJson(stateFile, null),
     now,
   );
+  const previous = migratedState
+    ? {
+        ...migratedState,
+        rejectionCycles: pruneRejectionCycles(
+          migratedState.rejectionCycles,
+          nowMs,
+        ),
+        returnDispatches: pruneReturnDispatches(
+          migratedState.returnDispatches,
+          nowMs,
+        ),
+      }
+    : null;
   const issues = await fetchLifecycleIssues();
   const inProgressIssues = await fetchInProgressIssuesWithComments();
   const trackedCycleIssues = await fetchTrackedCycleIssuesWithComments(
@@ -1033,12 +1476,32 @@ async function pollLifecycle() {
     new Set(inProgressIssues.map((issue) => issue.id)),
   );
   const observedCycleIssues = [...inProgressIssues, ...trackedCycleIssues];
+  const newlyResolvedReadyForQa = new Map(
+    extractRejectionObservations(observedCycleIssues)
+      .filter((observation) => {
+        const previousCycle =
+          previous?.rejectionCycles?.[observation.comment.id];
+        return (
+          observation.resolved &&
+          observation.issue.state?.name === "Ready for QA" &&
+          previousCycle &&
+          !String(previousCycle.status || "").startsWith("resolved_") &&
+          !String(previousCycle.status || "").startsWith("closed_") &&
+          !previous?.returnDispatches?.[observation.resolutionCommentId]
+        );
+      })
+      .map((observation) => [
+        observation.issue.id,
+        observation.resolutionCommentId,
+      ]),
+  );
   const paperclipIssues = await fetchPaperclipIssues();
 
   if (!previous) {
     const active = {};
     const transitionHistory = {};
     const entrySequences = {};
+    const dispatchFailures = [];
     let dispatched = 0;
     for (const issue of issues) {
       if (issue.stage.state === "Done") {
@@ -1064,6 +1527,11 @@ async function pollLifecycle() {
         entrySequences[key] = entrySequence;
         dispatched += 1;
       } catch (error) {
+        dispatchFailures.push(
+          `${issue.identifier} in ${issue.stage.state}: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
         process.stderr.write(
           `${now} failed initial dispatch ${issue.identifier} in ${issue.stage.state}: ${error instanceof Error ? error.message : String(error)}\n`,
         );
@@ -1076,6 +1544,7 @@ async function pollLifecycle() {
       active,
       transitionHistory,
       entrySequences,
+      returnDispatches: {},
       guardNotifications: {},
       monitorInvariantNotifications: {},
       withdrawnPolicyInteractions: {},
@@ -1088,7 +1557,11 @@ async function pollLifecycle() {
       paperclipIssues,
       {},
     );
-    const monitorResult = await enforceDeliveryMonitorInvariant(paperclipIssues, {});
+    const monitorResult = await enforceDeliveryMonitorInvariant(
+      paperclipIssues,
+      {},
+      rejectionResult.cycles,
+    );
     const interactionResult = await enforceInteractionPolicy({});
     await writeJsonAtomic(stateFile, {
       version: 5,
@@ -1097,19 +1570,27 @@ async function pollLifecycle() {
       active,
       transitionHistory,
       entrySequences,
+      returnDispatches: {},
       guardNotifications: {},
       monitorInvariantNotifications: monitorResult.notifications,
       withdrawnPolicyInteractions: interactionResult.handled,
       rejectionCycles: rejectionResult.cycles,
     });
     await writeJsonAtomic(healthFile, {
-      status: "ok",
+      status: lifecycleHealthStatus(
+        dispatchFailures,
+        monitorResult.violations,
+        rejectionResult.violations,
+      ),
       lastPollAt: now,
       activeByState: countByState(issues),
       initializedFromBaseline: true,
       dispatched,
+      dispatchFailures,
       monitorInvariantViolations: monitorResult.violations,
       monitorInvariantRepairs: monitorResult.repaired,
+      monitorInvariantClosures: monitorResult.closed,
+      monitorInvariantStops: monitorResult.stopped,
       withdrawnInvalidConfirmations: interactionResult.withdrawn,
       rejectionCyclesDetected: rejectionResult.detected,
       rejectionInvariantViolations: rejectionResult.violations,
@@ -1127,13 +1608,22 @@ async function pollLifecycle() {
   const nextActive = {};
   const transitionHistory = pruneHistory(previous.transitionHistory, nowMs);
   const entrySequences = { ...(previous.entrySequences || {}) };
-  const guardNotifications = { ...(previous.guardNotifications || {}) };
+  const returnDispatches = { ...(previous.returnDispatches || {}) };
+  const guardNotifications = Object.fromEntries(
+    Object.entries(previous.guardNotifications || {}).filter(([key]) =>
+      Object.hasOwn(transitionHistory, key),
+    ),
+  );
   const guardWarnings = [];
+  const dispatchFailures = [];
   let dispatched = 0;
   let guarded = 0;
   for (const issue of issues) {
     const existing = previous.active?.[issue.id];
-    if (existing?.state === issue.stage.state) {
+    const forcedReadyForQaReentry =
+      issue.stage.state === "Ready for QA" &&
+      newlyResolvedReadyForQa.has(issue.id);
+    if (existing?.state === issue.stage.state && !forcedReadyForQaReentry) {
       nextActive[issue.id] = existing;
       continue;
     }
@@ -1143,6 +1633,7 @@ async function pollLifecycle() {
       if (!guardNotifications[key]) {
         try {
           await reportCycleGuard(issue, paperclipIssues, entries.length);
+          guardNotifications[key] = now;
         } catch (error) {
           guardWarnings.push(
             `${issue.identifier} lifecycle guard could not be surfaced: ${
@@ -1150,7 +1641,6 @@ async function pollLifecycle() {
             }`,
           );
         }
-        guardNotifications[key] = now;
       }
       nextActive[issue.id] = {
         identifier: issue.identifier,
@@ -1173,11 +1663,24 @@ async function pollLifecycle() {
       };
       transitionHistory[key] = [...entries, now];
       entrySequences[key] = entrySequence;
+      if (forcedReadyForQaReentry) {
+        const resolutionCommentId =
+          newlyResolvedReadyForQa.get(issue.id);
+        returnDispatches[resolutionCommentId] = {
+          routineRunId: run.id,
+          dispatchedAt: now,
+        };
+      }
       dispatched += 1;
       process.stdout.write(
         `${now} dispatched ${issue.identifier} in ${issue.stage.state} as routine run ${run.id}\n`,
       );
     } catch (error) {
+      dispatchFailures.push(
+        `${issue.identifier} in ${issue.stage.state}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
       process.stderr.write(
         `${now} failed to dispatch ${issue.identifier} in ${issue.stage.state}: ${error instanceof Error ? error.message : String(error)}\n`,
       );
@@ -1192,6 +1695,7 @@ async function pollLifecycle() {
     active: nextActive,
     transitionHistory,
     entrySequences,
+    returnDispatches,
     guardNotifications,
     monitorInvariantNotifications:
       previous.monitorInvariantNotifications || {},
@@ -1210,6 +1714,7 @@ async function pollLifecycle() {
   const monitorResult = await enforceDeliveryMonitorInvariant(
     paperclipIssues,
     previous.monitorInvariantNotifications,
+    rejectionResult.cycles,
   );
   const interactionResult = await enforceInteractionPolicy(
     previous.withdrawnPolicyInteractions,
@@ -1223,20 +1728,29 @@ async function pollLifecycle() {
     active: nextActive,
     transitionHistory,
     entrySequences,
+    returnDispatches,
     guardNotifications,
     monitorInvariantNotifications: monitorResult.notifications,
     withdrawnPolicyInteractions: interactionResult.handled,
     rejectionCycles: rejectionResult.cycles,
   });
   await writeJsonAtomic(healthFile, {
-    status: "ok",
+    status: lifecycleHealthStatus(
+      dispatchFailures,
+      guardWarnings,
+      monitorResult.violations,
+      rejectionResult.violations,
+    ),
     lastPollAt: now,
     activeByState: countByState(issues),
     dispatched,
+    dispatchFailures,
     guarded,
     lifecycleGuardWarnings: guardWarnings,
     monitorInvariantViolations: monitorResult.violations,
     monitorInvariantRepairs: monitorResult.repaired,
+    monitorInvariantClosures: monitorResult.closed,
+    monitorInvariantStops: monitorResult.stopped,
     withdrawnInvalidConfirmations: interactionResult.withdrawn,
     rejectionCyclesDetected: rejectionResult.detected,
     rejectionInvariantViolations: rejectionResult.violations,

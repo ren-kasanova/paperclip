@@ -14,7 +14,7 @@ node -e '
   const fs = require("node:fs");
   const health = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
   const lastPollMs = Date.parse(health.lastPollAt || "");
-  if (health.status !== "ok") process.exit(1);
+  if (!["ok", "degraded"].includes(health.status)) process.exit(1);
   if (!Number.isFinite(lastPollMs)) process.exit(1);
   if (Date.now() - lastPollMs > 5 * 60 * 1000) process.exit(1);
 ' "$watcher_health"

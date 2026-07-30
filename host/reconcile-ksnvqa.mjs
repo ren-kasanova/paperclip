@@ -178,8 +178,30 @@ async function reconcileRoutines() {
   }
 }
 
+async function fetchAllCompanyIssues() {
+  const issues = [];
+  const limit = 1000;
+  let offset = 0;
+  while (true) {
+    const query = new URLSearchParams({
+      limit: String(limit),
+      offset: String(offset),
+      projectId: ids.project,
+    });
+    const page = await fetchJson(
+      `/companies/${ids.company}/issues?${query}`,
+    );
+    if (!Array.isArray(page)) {
+      throw new Error("KSNVQA issue list returned an invalid response");
+    }
+    issues.push(...page);
+    if (page.length < limit) return issues;
+    offset += page.length;
+  }
+}
+
 async function reconcileIssueMetadata() {
-  const issues = await fetchJson(`/companies/${ids.company}/issues`);
+  const issues = await fetchAllCompanyIssues();
   for (const issue of issues) {
     if (
       typeof issue.title === "string" &&
@@ -278,7 +300,7 @@ await reconcileAgent(
     config.cwd = "/app";
     config.command = "node";
     config.args = ["/opt/paperclip-watcher/ksnvqa-rfqa-intake.mjs"];
-    config.timeoutSec = 45;
+    config.timeoutSec = 300;
     config.env.STATE_DIR = plain(
       "/paperclip/instances/default/data/ksnvqa-rfqa-intake",
     );

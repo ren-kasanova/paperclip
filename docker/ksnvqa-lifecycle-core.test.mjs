@@ -2,10 +2,13 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  buildDeliveryMonitorPolicy,
   boundedSourceTitle,
   deliveryMonitorCandidates,
   extractRejectionObservations,
   extractUnresolvedRejections,
+  isProductionPromotionInteraction,
+  lifecycleHealthStatus,
   migrateLifecycleState,
   monitorHasLivePath,
   productionApprovalTargetViolation,
@@ -136,6 +139,45 @@ test("a persisted schedule or freshly triggered monitor is a live path", () => {
   );
 });
 
+test("monitor repair preserves the complete execution policy and durable timeout", () => {
+  const timeoutAt = "2026-08-02T12:00:00.000Z";
+  const policy = buildDeliveryMonitorPolicy(
+    {
+      identifier: "KSNVQA-19",
+      title: "[KSNV-188] Marketplace P95 spike — Delivery QA-return monitor",
+      executionPolicy: {
+        mode: "supervised",
+        stages: [{ id: "review", type: "review" }],
+        reviewPreset: { mode: "required" },
+        authorizationPolicy: { mode: "restricted" },
+        commentRequired: false,
+        monitor: {
+          scheduledBy: "assignee",
+          timeoutAt,
+        },
+      },
+    },
+    "rejection-188",
+    {
+      nowMs: Date.parse("2026-07-30T12:00:00.000Z"),
+      delayMs: 2 * 60 * 60 * 1000,
+      returnTimeoutMs: 72 * 60 * 60 * 1000,
+    },
+  );
+  assert.equal(policy.mode, "supervised");
+  assert.deepEqual(policy.stages, [{ id: "review", type: "review" }]);
+  assert.deepEqual(policy.reviewPreset, { mode: "required" });
+  assert.deepEqual(policy.authorizationPolicy, { mode: "restricted" });
+  assert.equal(policy.commentRequired, false);
+  assert.equal(policy.monitor.timeoutAt, timeoutAt);
+  assert.equal(policy.monitor.nextCheckAt, "2026-07-30T14:00:00.000Z");
+});
+
+test("dispatch or invariant failures degrade watcher health", () => {
+  assert.equal(lifecycleHealthStatus([], [], []), "ok");
+  assert.equal(lifecycleHealthStatus(["dispatch failed"], []), "degraded");
+});
+
 test("near-miss rejection headlines are routed instead of disappearing", () => {
   const issue = {
     id: "linear-variant",
@@ -226,6 +268,7 @@ test("version 4 state migration adds durable entry sequences", () => {
       rejectionCycles: {},
       migratedAt: "2026-07-30T12:00:00.000Z",
       entrySequences: {},
+      returnDispatches: {},
     },
   );
 });
@@ -286,6 +329,72 @@ test("production approval is fail-closed unless artifact-bound", () => {
       },
     }),
     null,
+  );
+  assert.match(
+    productionApprovalTargetViolation(
+      {
+        ...base,
+        title: "Approve Android app promotion to prod after TN10 QA",
+        payload: {
+          ...base.payload,
+          target: {
+            type: "custom",
+            key: "KSNV-188:production-promotion:signed-pipeline",
+            revisionId: "sha256:abc",
+          },
+        },
+      },
+      "KSNV-217",
+    ),
+    /must reference KSNV-217/,
+  );
+  assert.match(
+    productionApprovalTargetViolation({
+      kind: "request_confirmation",
+      title: "Approve rollout",
+      payload: {
+        prompt: "Ship the signed app",
+        detailsMarkdown:
+          "Promote to live. Artifact: app\nDigest: sha256:abc\nRelease path: signed pipeline\nRollback: previous digest",
+      },
+    }),
+    /immutable custom target/,
+  );
+  assert.equal(
+    isProductionPromotionInteraction({
+      kind: "request_confirmation",
+      title: "Approve Android app promotion to prod after TN10 QA",
+      payload: { prompt: "Ship the signed release" },
+    }),
+    true,
+  );
+  assert.equal(
+    isProductionPromotionInteraction({
+      kind: "request_confirmation",
+      title: "Approve provisioning of a funded test fixture",
+      payload: {
+        detailsMarkdown: "Blocks the production rollout scheduled next week",
+      },
+    }),
+    false,
+  );
+  assert.equal(
+    isProductionPromotionInteraction({
+      kind: "request_confirmation",
+      title: "Approve lock release for the production signing fixture",
+    }),
+    false,
+  );
+  assert.equal(
+    isProductionPromotionInteraction({
+      kind: "request_confirmation",
+      title: "Approve production rollout after funded-wallet fixture QA",
+      payload: {
+        detailsMarkdown:
+          "The staging deployment is excluded; promote the signed live artifact.",
+      },
+    }),
+    true,
   );
   assert.equal(
     rejectionCycleMarker("11111111-1111-4111-8111-111111111111"),
