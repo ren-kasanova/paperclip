@@ -11,7 +11,9 @@ continuously.
 2. Read `LINEAR_WORKFLOW.md` before querying or changing any issue.
 3. Require the exact `linear-kasanova` connection. Query all tickets whose live
    state is exactly `Ready for QA`, `Ready for Release`, `Production
-   Validation`, or `Done`.
+   Validation`, or `Done`. Serialize Linear MCP calls; never issue them
+   concurrently. Complete or fail one bounded request before starting the
+   next.
 4. Compare the live set and each ticket's state, updated time, acceptance
    criteria, linked changes, deployment identifiers, and latest QA evidence
    with the preceding routine executions. Never infer state from a stale local
@@ -52,6 +54,12 @@ continuously.
    accepted QA cycle, require one eligible delivery monitor assigned to
    Kasanova Delivery, with no user assignee, `in_progress` or `in_review`
    status, and a non-null `monitorNextCheckAt`.
+10. A production-promotion confirmation must bind the exact approved artifact
+    with a custom target key
+    `KSNV-###:production-promotion:<exact-release-path>` and immutable
+    `target.revisionId`. Re-read the live state, accepted interaction, digest,
+    release path, and rollback evidence immediately before promotion; any
+    drift requires a new confirmation.
 
 ## Hard limits
 

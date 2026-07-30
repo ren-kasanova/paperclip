@@ -11,6 +11,19 @@ not in the source tree. The whole `docker/` directory is mounted read-only;
 never return to a single-file watcher bind because atomic source updates leave
 that bind pinned to a deleted inode.
 
+The lifecycle watcher serializes its Linear reads and holds an atomic,
+stale-safe state lock so timer and event wakes cannot process the same cycle
+concurrently. State schema v4 keeps a durable rejection ledger keyed by the
+immutable Linear `QA REJECTED` comment ID. While the source issue is `In
+Progress`, the watcher audits the structured rejection, creates or reopens
+the single source-bound Delivery monitor idempotently, and records the cycle ID
+in both the monitor policy and a read-before-write Paperclip comment.
+Incomplete historical formatting is a durable evidence warning but does not
+strand the immutable handoff. A
+`QA RETURN RESOLVED` closes that cycle only when it cites the exact rejection
+ID. `done` monitors can be reopened; `cancelled` monitors fail closed and are
+reported as invariant violations.
+
 Each event routine declares required `linear_identifier` and `linear_title`
 variables. The watcher supplies the exact Linear key and source title so its
 Paperclip execution title is born as
@@ -22,6 +35,13 @@ host-side `com.odessa.paperclip-deck7-router` LaunchAgent polls Paperclip's
 attention feed and uses the authenticated DECK·7 `paperclip` source. This keeps
 the DECK·7 source credential off the container and preserves Paperclip as the
 authoritative decision record.
+
+Malformed confirmation requests are rejected by policy before they reach Ren:
+reads, browser authorization, and assigned Android use cannot be approval
+subjects. Production-promotion confirmations additionally require an immutable
+custom target containing the KSNV key, exact release path, artifact/release
+revision, digest, and rollback evidence. Valid state-changing confirmations
+remain pending for Ren and are routed by DECK·7.
 
 The server reads only a copy of the relay credential from the external
 `paperclip_odessa_deck7_router` volume. Colima does not reliably project the
@@ -40,7 +60,9 @@ profile. Ren explicitly authorized Kasanova QA on 2026-07-30 to use Codex's
 combined sandbox/approval bypass and rely on the outer Landlock boundary. This
 removes nested noninteractive prompts only; real governed effects still route
 through Paperclip interactions and DECK·7, and browser access remains
-separately prohibited.
+separately prohibited. Kasanova QA runs have a one-hour total timeout and
+Paperclip's seven-minute output-inactivity guard. Linear MCP calls are
+serialized so one bounded upstream request owns the active timeout path.
 
 On a brand-new watcher state, currently active non-`Done` lifecycle stages are
 dispatched immediately. `Done` is baselined without replay. A migrated watcher

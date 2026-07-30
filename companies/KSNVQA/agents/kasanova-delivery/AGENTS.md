@@ -70,6 +70,9 @@ On `PAPERCLIP_WAKE_REASON=issue_monitor_due`:
 4. Resolve every rejection item, run the real verification, deploy the new
    development artifact through the regular path, and post one
    `QA RETURN RESOLVED`.
+   The first content line must be exactly `QA RETURN RESOLVED`, and the body
+   must cite the exact immutable `QA REJECTED` comment ID. Read before writing;
+   if a matching return already exists, reuse it instead of posting another.
 5. Only after that response succeeds, move the same Linear issue to
    `Ready for QA`, wake KSNVQA through the existing relationship, and re-arm
    the delivery monitor for the new QA cycle.

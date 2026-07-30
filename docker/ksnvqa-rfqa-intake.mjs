@@ -1,5 +1,21 @@
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  open,
+  readFile,
+  rename,
+  stat,
+  unlink,
+  writeFile,
+} from "node:fs/promises";
 import path from "node:path";
+
+import {
+  deliveryMonitorCandidates,
+  extractUnresolvedRejections,
+  monitorHasLivePath,
+  productionApprovalTargetViolation,
+  rejectionCycleMarker,
+} from "./ksnvqa-lifecycle-core.mjs";
 
 const required = [
   "LINEAR_API_KEY",
@@ -70,6 +86,8 @@ const stages = [
 
 const stateFile = path.join(config.stateDir, "state.json");
 const healthFile = path.join(config.stateDir, "health.json");
+const lockFile = path.join(config.stateDir, "watcher.lock");
+const lockStaleMs = 5 * 60 * 1000;
 
 async function readJson(file, fallback) {
   try {
@@ -84,6 +102,44 @@ async function writeJsonAtomic(file, value) {
   const temporary = `${file}.tmp`;
   await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
   await rename(temporary, file);
+}
+
+async function acquireLock() {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const handle = await open(lockFile, "wx", 0o600);
+      await handle.writeFile(
+        `${JSON.stringify({ pid: process.pid, acquiredAt: new Date().toISOString() })}\n`,
+      );
+      return handle;
+    } catch (error) {
+      if (error?.code !== "EEXIST") throw error;
+      let lockStat;
+      try {
+        lockStat = await stat(lockFile);
+      } catch (statError) {
+        if (statError?.code === "ENOENT") continue;
+        throw statError;
+      }
+      if (Date.now() - lockStat.mtimeMs < lockStaleMs) return null;
+      try {
+        await unlink(lockFile);
+      } catch (unlinkError) {
+        if (unlinkError?.code !== "ENOENT") throw unlinkError;
+      }
+    }
+  }
+  return null;
+}
+
+async function releaseLock(handle) {
+  if (!handle) return;
+  await handle.close();
+  try {
+    await unlink(lockFile);
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
 }
 
 async function fetchJson(url, options = {}) {
@@ -102,7 +158,7 @@ async function fetchJson(url, options = {}) {
   return body;
 }
 
-async function fetchIssuesByState(state) {
+async function fetchIssuesByState(state, { includeComments = false } = {}) {
   const query = `
     query KasanovaIssuesByState($state: String!, $after: String) {
       issues(
@@ -118,6 +174,11 @@ async function fetchIssuesByState(state) {
           updatedAt
           state { name }
           team { key name }
+          ${
+            includeComments
+              ? "comments(last: 100) { nodes { id body createdAt updatedAt } }"
+              : ""
+          }
         }
         pageInfo { hasNextPage endCursor }
       }
@@ -150,13 +211,16 @@ async function fetchIssuesByState(state) {
 }
 
 async function fetchLifecycleIssues() {
-  const results = await Promise.all(
-    stages.map(async (stage) => {
-      const issues = await fetchIssuesByState(stage.state);
-      return issues.map((issue) => ({ ...issue, stage }));
-    }),
-  );
+  const results = [];
+  for (const stage of stages) {
+    const issues = await fetchIssuesByState(stage.state);
+    results.push(issues.map((issue) => ({ ...issue, stage })));
+  }
   return results.flat();
+}
+
+async function fetchInProgressIssuesWithComments() {
+  return fetchIssuesByState("In Progress", { includeComments: true });
 }
 
 async function dispatchIssue(issue) {
@@ -205,12 +269,276 @@ async function postIssueComment(issueId, body) {
   });
 }
 
+async function fetchIssueComments(issueId) {
+  const comments = await fetchJson(
+    `${config.paperclipApiUrl}/issues/${issueId}/comments?order=desc&limit=100`,
+  );
+  if (!Array.isArray(comments)) {
+    throw new Error(`Paperclip comments endpoint returned an invalid response for ${issueId}`);
+  }
+  return comments;
+}
+
+async function fetchIssueInteractions(issueId) {
+  const interactions = await fetchJson(
+    `${config.paperclipApiUrl}/issues/${issueId}/interactions`,
+  );
+  if (!Array.isArray(interactions)) {
+    throw new Error(`Paperclip interactions endpoint returned an invalid response for ${issueId}`);
+  }
+  return interactions;
+}
+
+async function ensureIssueComment(issueId, marker, body) {
+  const comments = await fetchIssueComments(issueId);
+  if (comments.some((comment) => String(comment?.body || "").includes(marker))) {
+    return false;
+  }
+  await postIssueComment(issueId, body);
+  return true;
+}
+
 async function patchIssue(issueId, body) {
   return fetchJson(`${config.paperclipApiUrl}/issues/${issueId}`, {
     method: "PATCH",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body),
   });
+}
+
+async function createPaperclipIssue(body) {
+  return fetchJson(
+    `${config.paperclipApiUrl}/companies/${config.companyId}/issues`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    },
+  );
+}
+
+function monitorPolicy(issue, rejectionCommentId, delayMs = 30 * 60 * 1000) {
+  const nextCheckAt = new Date(Date.now() + delayMs);
+  const timeoutAt = new Date(Date.now() + 72 * 60 * 60 * 1000);
+  const linearIdentifier =
+    typeof issue.title === "string"
+      ? issue.title.match(/^\[(KSNV-\d+)\]/)?.[1]
+      : null;
+  return {
+    mode: issue.executionPolicy?.mode || "normal",
+    stages: Array.isArray(issue.executionPolicy?.stages)
+      ? issue.executionPolicy.stages
+      : [],
+    monitor: {
+      kind: "external_service",
+      serviceName: "Kasanova QA lifecycle",
+      externalRef: [
+        linearIdentifier ? `linear:${linearIdentifier}` : null,
+        rejectionCommentId ? `linear-comment:${rejectionCommentId}` : null,
+        `paperclip:${issue.identifier}`,
+      ].filter(Boolean).join("|"),
+      nextCheckAt: nextCheckAt.toISOString(),
+      timeoutAt: timeoutAt.toISOString(),
+      maxAttempts: 96,
+      recoveryPolicy: "wake_owner",
+      notes:
+        "Re-read the live Linear issue and immutable rejection, repair only delivery-owned work, post one QA RETURN RESOLVED citing the rejection ID, then return the same issue to Ready for QA.",
+    },
+    commentRequired: true,
+  };
+}
+
+function latestSourceBoundIssue(paperclipIssues, identifier) {
+  const prefix = `[${identifier}]`;
+  return paperclipIssues
+    .filter(
+      (issue) =>
+        typeof issue?.title === "string" &&
+        issue.title.startsWith(prefix) &&
+        !issue.title.endsWith("— Delivery QA-return monitor"),
+    )
+    .sort((left, right) =>
+      String(right.updatedAt || "").localeCompare(String(left.updatedAt || "")),
+    )[0] || null;
+}
+
+async function createDeliveryMonitor(linearIssue, paperclipIssues, rejectionCommentId) {
+  const parent = latestSourceBoundIssue(paperclipIssues, linearIssue.identifier);
+  const monitor = await createPaperclipIssue({
+    projectId: config.projectId,
+    projectWorkspaceId: config.projectWorkspaceId,
+    parentId: parent?.id || null,
+    title: `[${linearIssue.identifier}] ${linearIssue.title} — Delivery QA-return monitor`,
+    description: [
+      `Persist the delivery-owned QA-return loop for [${linearIssue.identifier}](${linearIssue.url}).`,
+      "",
+      `Immutable rejection comment: \`${rejectionCommentId}\`.`,
+      "",
+      "Do not approve QA, promote production, validate production, or advance a QA-owned gate.",
+    ].join("\n"),
+    status: "todo",
+    priority: "high",
+    assigneeAgentId: config.deliveryAgentId,
+    assigneeUserId: null,
+    idempotencyKey: `ksnvqa-delivery-monitor:${linearIssue.id}`,
+  });
+  return monitor;
+}
+
+async function enforceRejectionCycles(
+  inProgressIssues,
+  lifecycleIssues,
+  paperclipIssues,
+  previousCycles,
+) {
+  const cycles = { ...(previousCycles || {}) };
+  const violations = [];
+  const evidenceWarnings = [];
+  const repaired = [];
+  const detected = extractUnresolvedRejections(inProgressIssues);
+  const detectedIds = new Set(detected.map((entry) => entry.comment.id));
+  const currentStateByIssueId = new Map([
+    ...inProgressIssues.map((issue) => [issue.id, issue.state?.name || "In Progress"]),
+    ...lifecycleIssues.map((issue) => [issue.id, issue.stage.state]),
+  ]);
+
+  for (const rejection of detected) {
+    const { issue: linearIssue, comment, completeness } = rejection;
+    const marker = rejectionCycleMarker(comment.id);
+    const evidenceMarker = `KSNVQA rejection evidence warning: ${comment.id}`;
+    const cycle = {
+      ...(cycles[comment.id] || {}),
+      linearIssueId: linearIssue.id,
+      identifier: linearIssue.identifier,
+      rejectionCommentId: comment.id,
+      detectedAt: cycles[comment.id]?.detectedAt || new Date().toISOString(),
+      lastSeenAt: new Date().toISOString(),
+    };
+
+    if (!completeness.complete) {
+      const reason =
+        `${linearIssue.identifier} rejection ${comment.id} is missing structured fields: ` +
+        completeness.missing.join(", ");
+      evidenceWarnings.push(reason);
+      cycle.evidenceWarning = reason;
+      cycle.missingFields = completeness.missing;
+      const sourceIssue = latestSourceBoundIssue(paperclipIssues, linearIssue.identifier);
+      if (sourceIssue && !["done", "cancelled"].includes(sourceIssue.status)) {
+        await ensureIssueComment(
+          sourceIssue.id,
+          evidenceMarker,
+          [
+            "## Rejection handoff evidence warning",
+            "",
+            evidenceMarker,
+            "",
+            reason,
+            "",
+            "The immutable rejection is still routed so delivery cannot be stranded. Kasanova QA must repair the existing Linear rejection comment; it must not create a duplicate rejection.",
+          ].join("\n"),
+        );
+      }
+    } else {
+      delete cycle.evidenceWarning;
+      delete cycle.missingFields;
+    }
+
+    let candidates = deliveryMonitorCandidates(
+      paperclipIssues,
+      linearIssue.identifier,
+    );
+    if (candidates.length === 0) {
+      const created = await createDeliveryMonitor(
+        linearIssue,
+        paperclipIssues,
+        comment.id,
+      );
+      paperclipIssues.push(created);
+      candidates = [created];
+      repaired.push(`${created.identifier}:created:${comment.id}`);
+    }
+    if (candidates.length !== 1) {
+      const reason =
+        `${linearIssue.identifier} has ${candidates.length} Delivery QA-return monitors; expected exactly one`;
+      violations.push(reason);
+      cycle.status = "blocked_monitor_cardinality";
+      cycle.paperclipIssueIds = candidates.map((candidate) => candidate.id);
+      cycles[comment.id] = cycle;
+      continue;
+    }
+
+    const monitor = candidates[0];
+    cycle.monitorIssueId = monitor.id;
+    cycle.monitorIdentifier = monitor.identifier;
+    if (monitor.status === "cancelled") {
+      const reason =
+        `${linearIssue.identifier} canonical Delivery monitor ${monitor.identifier} is cancelled and requires Ren to choose recovery`;
+      violations.push(reason);
+      cycle.status = "blocked_cancelled_monitor";
+      cycles[comment.id] = cycle;
+      continue;
+    }
+
+    const interactions = await fetchIssueInteractions(monitor.id);
+    if (monitorHasLivePath(monitor, interactions)) {
+      cycle.status = interactions.some((interaction) => interaction.status === "pending")
+        ? "routed_pending_interaction"
+        : "routed_live_execution";
+      cycles[comment.id] = cycle;
+      continue;
+    }
+
+    const policy = monitorPolicy(monitor, comment.id);
+    await patchIssue(monitor.id, {
+      status: "in_review",
+      assigneeAgentId: config.deliveryAgentId,
+      assigneeUserId: null,
+      executionPolicy: policy,
+    });
+    await ensureIssueComment(
+      monitor.id,
+      marker,
+      [
+        "## QA rejection routed to Delivery",
+        "",
+        marker,
+        "",
+        `- Linear: [${linearIssue.identifier}](${linearIssue.url})`,
+        `- Immutable rejection comment: \`${comment.id}\``,
+        "- Owner: Kasanova Delivery; no user assignee.",
+        `- Next check: \`${policy.monitor.nextCheckAt}\`.`,
+        "- Delivery must post exactly one `QA RETURN RESOLVED` that cites this rejection ID before returning the same Linear issue to `Ready for QA`.",
+      ].join("\n"),
+    );
+    repaired.push(`${monitor.identifier}:reopened:${comment.id}`);
+    cycle.status = "routed_monitor";
+    cycle.routedAt = new Date().toISOString();
+    cycles[comment.id] = cycle;
+  }
+
+  for (const [commentId, cycle] of Object.entries(cycles)) {
+    if (detectedIds.has(commentId)) continue;
+    const currentState = currentStateByIssueId.get(cycle.linearIssueId);
+    if (!currentState) continue;
+    cycles[commentId] = {
+      ...cycle,
+      status:
+        currentState === "In Progress"
+          ? "resolved_return_observed"
+          : "resolved_or_advanced",
+      lastObservedState: currentState,
+      resolvedAt: cycle.resolvedAt || new Date().toISOString(),
+      lastSeenAt: new Date().toISOString(),
+    };
+  }
+
+  return {
+    cycles,
+    detected: detected.length,
+    violations,
+    evidenceWarnings,
+    repaired,
+  };
 }
 
 async function reportCycleGuard(issue, paperclipIssues, count) {
@@ -253,11 +581,8 @@ async function enforceDeliveryMonitorInvariant(paperclipIssues, previousNotifica
     const eligibleStatus = ["in_progress", "in_review"].includes(issue?.status);
     if (!isMonitor || !eligibleStatus) continue;
 
-    const hasLiveExecutionPath =
-      Boolean(issue.executionRunId) ||
-      Boolean(issue.checkoutRunId) ||
-      ["queued", "running"].includes(issue.executionState?.status);
-    if (hasLiveExecutionPath) {
+    const interactions = await fetchIssueInteractions(issue.id);
+    if (monitorHasLivePath(issue, interactions)) {
       delete notifications[issue.id];
       continue;
     }
@@ -270,36 +595,18 @@ async function enforceDeliveryMonitorInvariant(paperclipIssues, previousNotifica
       delete notifications[issue.id];
       continue;
     }
-    const nextCheckAt = new Date(Date.now() + 2 * 60 * 60 * 1000);
-    const timeoutAt = new Date(Date.now() + 72 * 60 * 60 * 1000);
-    const linearIdentifier =
-      typeof issue.title === "string"
-        ? issue.title.match(/^\[(KSNV-\d+)\]/)?.[1]
-        : null;
+    const rejectionCommentId =
+      String(issue.executionPolicy?.monitor?.externalRef || "")
+        .match(/(?:^|\|)linear-comment:([^|]+)/)?.[1] || null;
+    const executionPolicy = monitorPolicy(
+      issue,
+      rejectionCommentId,
+      2 * 60 * 60 * 1000,
+    );
     await patchIssue(issue.id, {
       assigneeAgentId: config.deliveryAgentId,
       assigneeUserId: null,
-      executionPolicy: {
-        mode: issue.executionPolicy?.mode || "normal",
-        stages: Array.isArray(issue.executionPolicy?.stages)
-          ? issue.executionPolicy.stages
-          : [],
-        monitor: {
-          kind: "external_service",
-          serviceName: "Kasanova QA lifecycle",
-          externalRef: [
-            linearIdentifier ? `linear:${linearIdentifier}` : null,
-            `paperclip:${issue.identifier}`,
-          ].filter(Boolean).join("|"),
-          nextCheckAt: nextCheckAt.toISOString(),
-          timeoutAt: timeoutAt.toISOString(),
-          maxAttempts: 96,
-          recoveryPolicy: "wake_owner",
-          notes:
-            "Persist the existing QA-return delivery loop, recheck the immutable rejection and canonical KSNVQA task, and never advance a QA-owned gate.",
-        },
-        commentRequired: true,
-      },
+      executionPolicy,
     });
     repaired.push(issue.identifier);
     if (notifications[issue.id]) continue;
@@ -311,7 +618,7 @@ async function enforceDeliveryMonitorInvariant(paperclipIssues, previousNotifica
         "The zero-token Kasanova lifecycle watcher restored this active QA-return monitor's persisted wake path.",
         "",
         "- Owner: Kasanova Delivery; no user assignee.",
-        `- Next check: \`${nextCheckAt.toISOString()}\`.`,
+        `- Next check: \`${executionPolicy.monitor.nextCheckAt}\`.`,
         "- Recovery: `wake_owner`, 72-hour timeout, 96-attempt cap.",
         "- Preserve the same Linear issue, immutable rejection ID, and canonical KSNVQA task.",
       ].join("\n"),
@@ -383,7 +690,8 @@ async function enforceInteractionPolicy(previousHandled) {
       ? interactions.find((entry) => entry?.id === interactionId)
       : null;
     if (!interaction || interaction.status !== "pending") continue;
-    const reason = forbiddenConfirmationReason(interaction);
+    const productionViolation = productionApprovalTargetViolation(interaction);
+    const reason = forbiddenConfirmationReason(interaction) || productionViolation;
     if (!reason) continue;
     await fetchJson(
       `${config.paperclipApiUrl}/issues/${issueId}/interactions/${interactionId}/reject`,
@@ -393,6 +701,17 @@ async function enforceInteractionPolicy(previousHandled) {
         body: JSON.stringify({ reason }),
       },
     );
+    const remediation = productionViolation
+      ? [
+          "- Re-read the live `Ready for Release` state and QA evidence.",
+          "- Create a new confirmation whose custom target binds the exact artifact/release revision.",
+          "- Include the release path and rollback evidence; revalidate that same target immediately before promotion.",
+        ]
+      : [
+          "- Continue the preauthorized operation directly.",
+          "- If a real dependency is missing, request only the concrete provisioning.",
+          "- Browser access still requires Ren's exact current-message phrase `USA EL NAVEGADOR`.",
+        ];
     await postIssueComment(
       issueId,
       [
@@ -400,9 +719,7 @@ async function enforceInteractionPolicy(previousHandled) {
         "",
         reason,
         "",
-        "- Continue the preauthorized operation directly.",
-        "- If a real dependency is missing, request only the concrete provisioning.",
-        "- Browser access still requires Ren's exact current-message phrase `USA EL NAVEGADOR`.",
+        ...remediation,
       ].join("\n"),
     );
     handled[interactionId] = new Date().toISOString();
@@ -434,15 +751,15 @@ function countByState(issues) {
   );
 }
 
-async function main() {
-  await mkdir(config.stateDir, { recursive: true, mode: 0o700 });
+async function pollLifecycle() {
   const previous = await readJson(stateFile, null);
   const issues = await fetchLifecycleIssues();
+  const inProgressIssues = await fetchInProgressIssuesWithComments();
   const now = new Date().toISOString();
   const nowMs = new Date(now).getTime();
   const paperclipIssues = await fetchPaperclipIssues();
 
-  if (previous && ![2, 3].includes(previous.version)) {
+  if (previous && ![2, 3, 4].includes(previous.version)) {
     throw new Error(`Unsupported lifecycle watcher state version: ${previous.version}`);
   }
 
@@ -456,6 +773,14 @@ async function main() {
       guardNotifications: {},
       monitorInvariantNotifications: {},
       withdrawnPolicyInteractions: {},
+    };
+  }
+  if (state?.version === 3) {
+    state = {
+      ...state,
+      version: 4,
+      migratedAt: now,
+      rejectionCycles: {},
     };
   }
 
@@ -489,10 +814,16 @@ async function main() {
         );
       }
     }
+    const rejectionResult = await enforceRejectionCycles(
+      inProgressIssues,
+      issues,
+      paperclipIssues,
+      {},
+    );
     const monitorResult = await enforceDeliveryMonitorInvariant(paperclipIssues, {});
     const interactionResult = await enforceInteractionPolicy({});
     await writeJsonAtomic(stateFile, {
-      version: 3,
+      version: 4,
       initializedAt: now,
       lastPollAt: now,
       active,
@@ -500,6 +831,7 @@ async function main() {
       guardNotifications: {},
       monitorInvariantNotifications: monitorResult.notifications,
       withdrawnPolicyInteractions: interactionResult.handled,
+      rejectionCycles: rejectionResult.cycles,
     });
     await writeJsonAtomic(healthFile, {
       status: "ok",
@@ -510,6 +842,12 @@ async function main() {
       monitorInvariantViolations: monitorResult.violations,
       monitorInvariantRepairs: monitorResult.repaired,
       withdrawnInvalidConfirmations: interactionResult.withdrawn,
+      rejectionCyclesDetected: rejectionResult.detected,
+      rejectionInvariantViolations: rejectionResult.violations,
+      rejectionEvidenceWarnings: rejectionResult.evidenceWarnings,
+      rejectionInvariantRepairs: rejectionResult.repaired,
+      inProgressCount: inProgressIssues.length,
+      inProgressIdentifiers: inProgressIssues.map((issue) => issue.identifier),
     });
     process.stdout.write(
       `${now} initialized lifecycle watcher with ${issues.length} Kasanova issue(s), ${dispatched} non-Done dispatch(es)\n`,
@@ -565,6 +903,12 @@ async function main() {
     }
   }
 
+  const rejectionResult = await enforceRejectionCycles(
+    inProgressIssues,
+    issues,
+    paperclipIssues,
+    state.rejectionCycles,
+  );
   const monitorResult = await enforceDeliveryMonitorInvariant(
     paperclipIssues,
     state.monitorInvariantNotifications,
@@ -574,7 +918,7 @@ async function main() {
   );
 
   await writeJsonAtomic(stateFile, {
-    version: 3,
+    version: 4,
     initializedAt: state.initializedAt || now,
     migratedAt: state.migratedAt,
     lastPollAt: now,
@@ -583,6 +927,7 @@ async function main() {
     guardNotifications,
     monitorInvariantNotifications: monitorResult.notifications,
     withdrawnPolicyInteractions: interactionResult.handled,
+    rejectionCycles: rejectionResult.cycles,
   });
   await writeJsonAtomic(healthFile, {
     status: "ok",
@@ -593,10 +938,44 @@ async function main() {
     monitorInvariantViolations: monitorResult.violations,
     monitorInvariantRepairs: monitorResult.repaired,
     withdrawnInvalidConfirmations: interactionResult.withdrawn,
+    rejectionCyclesDetected: rejectionResult.detected,
+    rejectionInvariantViolations: rejectionResult.violations,
+    rejectionEvidenceWarnings: rejectionResult.evidenceWarnings,
+    rejectionInvariantRepairs: rejectionResult.repaired,
+    inProgressCount: inProgressIssues.length,
+    inProgressIdentifiers: inProgressIssues.map((issue) => issue.identifier),
   });
   process.stdout.write(
     `${now} lifecycle poll complete: ${issues.length} active, ${dispatched} dispatched, ${guarded} guarded\n`,
   );
+}
+
+async function main() {
+  await mkdir(config.stateDir, { recursive: true, mode: 0o700 });
+  const lock = await acquireLock();
+  if (!lock) {
+    process.stdout.write(
+      `${new Date().toISOString()} lifecycle poll skipped: another watcher holds the lock\n`,
+    );
+    return;
+  }
+  try {
+    await pollLifecycle();
+  } catch (error) {
+    const now = new Date().toISOString();
+    try {
+      await writeJsonAtomic(healthFile, {
+        status: "error",
+        lastPollAt: now,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    } catch {
+      // Preserve the original failure when even the health write is unavailable.
+    }
+    throw error;
+  } finally {
+    await releaseLock(lock);
+  }
 }
 
 await main();

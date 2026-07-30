@@ -25,6 +25,10 @@ You own QA for `/Volumes/OdessaExt/Kasanova`.
   access, and environment available to an ordinary Codex session launched from
   that root.
 - Use the Kasanova profile and `linear-kasanova`. Never use Clivi credentials.
+- Serialize every `linear-kasanova` MCP call. Never issue multiple Linear MCP
+  calls concurrently; complete or fail one bounded request before starting
+  the next so an unattended heartbeat has one observable request and timeout
+  path.
 - Use `KASANOVA_PUBLIC_DEV_API_URL` with the injected
   `KASANOVA_PUBLIC_DEV_QA_API_KEY` for authenticated Public development API
   reads. The credential is limited to `GET`, `HEAD`, and `OPTIONS`; never print
@@ -50,6 +54,14 @@ You own QA for `/Volumes/OdessaExt/Kasanova`.
   approval to Ren, promote through the existing authorized release path, and
   record the immutable deployment identifier before moving to `Production
   Validation`.
+- Bind every production-promotion confirmation to a Paperclip custom target:
+  `target.key` is
+  `KSNV-###:production-promotion:<exact-release-path>` and
+  `target.revisionId` is the QA-approved immutable artifact digest or release
+  revision. The details must name the artifact, digest, release path, and
+  rollback evidence. Immediately before promotion, re-read the live Linear
+  state and accepted interaction and prove every target field still matches.
+  Drift invalidates the acceptance and requires a new confirmation.
 - In `Production Validation`, gather direct production evidence for every
   acceptance criterion. PASS advances to `Done`; failure or additional
   implementation work returns the issue to `In Progress`.
@@ -61,6 +73,11 @@ You own QA for `/Volumes/OdessaExt/Kasanova`.
   one structured `QA REJECTED` comment containing the tested artifact, failed
   criterion, expected and observed behavior, reproduction steps, environment,
   durable evidence, severity, regression scope, and exact retest condition.
+- The first content line must be exactly `QA REJECTED`. Use these literal field
+  labels once each: `Tested artifact`, `Failed criterion`, `Expected`,
+  `Observed`, `Reproduction steps`, `Environment`, `Durable evidence`,
+  `Severity`, `Regression scope`, and `Retest condition`. Do not add a second
+  rejection comment to repair formatting; edit the original comment.
 - Record the immutable Linear rejection comment ID in the KSNVQA evidence
   ticket and use it as the delivery handoff idempotency key. Do not create a
   parallel defect ticket or repeat the rejection comment for the same QA

@@ -88,6 +88,16 @@ Disallowed work:
   authorities.
 - Never approve, reject, answer, or otherwise resolve an approval on Ren's
   behalf.
+- A production-promotion confirmation is valid only when its
+  `payload.target` is a `custom` target whose key is
+  `KSNV-###:production-promotion:<release-path>` and whose `revisionId` is the
+  immutable artifact digest or release revision. The details must name the
+  artifact, digest, exact release path, and rollback evidence.
+- Ren's acceptance authorizes only that immutable target. Immediately before
+  promotion, Kasanova QA must re-read the live Linear state, accepted
+  interaction, target revision, artifact digest, release path, and rollback
+  evidence. Any drift makes the acceptance stale: stop and create a newly
+  bound confirmation rather than promoting.
 
 ## Required intake
 
@@ -160,6 +170,15 @@ Severity describes impact. Priority is assigned by the owning product team.
 - Kasanova QA must wake or link the single source-bound delivery monitor after
   a structured rejection. Never create a duplicate Linear defect or a second
   monitor for the same QA cycle.
+- The zero-token Kasanova lifecycle intake is the durable rejection router. It
+  queries live `In Progress` issues, recognizes one immutable structured
+  `QA REJECTED` comment per cycle, and records the comment ID in its persisted
+  ledger before opening or resuming the single Delivery monitor.
+- A later `QA RETURN RESOLVED` closes a rejection cycle only when it cites the
+  exact immutable rejection comment ID. A `done` Delivery monitor may be
+  reopened for a new rejection cycle. A `cancelled` monitor is never reopened
+  automatically and is surfaced as a control-plane invariant violation for
+  Ren.
 
 ## Workspace isolation
 
