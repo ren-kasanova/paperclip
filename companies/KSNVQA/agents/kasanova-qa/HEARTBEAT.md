@@ -13,7 +13,9 @@
    and company policy. If a real dependency is unavailable, record the
    concrete blocker instead of requesting permission to probe it.
 6. For Android QA, read `ODESSA_ANDROID_DEVICE_LOCK` and use
-   `ADB_SERVER_SOCKET`; device and emulator use are preauthorized.
+   `ADB_SERVER_SOCKET`; device and emulator use are preauthorized. Treat
+   device absence, boot, or contention as a five-minute automatic retry, not
+   a `blocked` issue or Ren-facing interaction.
 7. Record exact versions, digests, commands, pass/fail counts, logs, and
    artifacts.
 8. Search Linear for duplicate defects before creating one.

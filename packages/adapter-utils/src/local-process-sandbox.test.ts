@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   buildLocalProcessSandboxSpawnTarget,
   parseLocalProcessFilesystemScope,
@@ -10,6 +10,7 @@ import {
   parseLocalProcessNetworkAllowlist,
   parseLocalProcessNetworkScope,
   parseLocalProcessSandboxExtraPaths,
+  removeLocalProcessSandboxTempDir,
   resolveLocalProcessRunScratchPath,
 } from "./local-process-sandbox.js";
 import { runChildProcess } from "./server-utils.js";
@@ -21,6 +22,25 @@ afterEach(async () => {
 });
 
 describe("local process sandbox", () => {
+  it("retries transient sandbox temp cleanup races", async () => {
+    const transient = Object.assign(new Error("directory not empty"), {
+      code: "ENOTEMPTY",
+    });
+    const rm = vi
+      .spyOn(fs, "rm")
+      .mockRejectedValueOnce(transient)
+      .mockResolvedValueOnce(undefined);
+    try {
+      await removeLocalProcessSandboxTempDir(
+        "/tmp/paperclip-landlock-cleanup-test",
+        2,
+      );
+      expect(rm).toHaveBeenCalledTimes(2);
+    } finally {
+      rm.mockRestore();
+    }
+  });
+
   it("parses read-only and writable extra paths", () => {
     expect(parseLocalProcessSandboxExtraPaths(["/opt/cache", { path: "/var/lib/tool", access: "rw" }])).toEqual([
       { path: "/opt/cache", access: "ro" },

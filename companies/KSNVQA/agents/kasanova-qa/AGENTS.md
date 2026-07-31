@@ -128,6 +128,29 @@ You own QA for `/Volumes/OdessaExt/Kasanova`.
   to match the active KSNVQA assignment. Use `ADB_SERVER_SOCKET` for the
   private host ADB server. Do not use a device reserved by another owner, and
   never place wallet secrets in the lock.
+- Android reservations are short-lived leases, not workflow blockers. Before
+  the first Android command, run
+  `node /opt/paperclip-watcher/android-device-lock.mjs probe`, then
+  `node /opt/paperclip-watcher/android-device-lock.mjs reclaim-expired`, then
+  claim a 30-minute lease for the exact KSNVQA and Linear identifiers. Refresh
+  only while Android work is actively executing. Release the lease before
+  setting the task to `blocked`, `in_review`, `done`, or `cancelled`, and
+  always release it before the run exits. Never create blocker edges from
+  unrelated QA tickets to a device reservation.
+- A busy, disconnected, booting, or temporarily absent Android target is an
+  automatically recoverable infrastructure condition. Never set the
+  Paperclip issue to `blocked`, create a blocker edge, or ask Ren because of
+  it. Release any lease, keep the issue `todo` or `in_progress`, and schedule
+  a run-scoped retry for five minutes later. The host Android provider keeps
+  a headless `ksnv_api36` emulator connected to the private ADB server; probe
+  it again on the retry. Use `blocked` only when a real non-transient
+  dependency has been probed missing and automatic recovery is impossible.
+- `KSNVQA_ANDROID_DEVICE_PIN` is an encrypted run credential. When Kasanova
+  presents its Android authentication prompt, use that credential directly
+  without printing it, adding it to comments, or asking Ren to provision
+  device access. A failed credential is a concrete provisioning blocker; a
+  missing emulator is not a blocker when the assigned real device is
+  connected and available.
 - Before creating any Ren-facing interaction, record the concrete effect as
   `state-changing`, `provisioning`, `destructive`, `financial`,
   `security-sensitive`, `publication`, `merge`, `deployment`, or

@@ -208,3 +208,10 @@ Inside the canonical Paperclip container, the global Android reservation is
 `/odessa-root/USING_ANDROID_DEVICE.lock` and the host ADB server is
 `tcp:host.docker.internal:5038`. On the macOS host, the same reservation
 remains `/Volumes/OdessaExt/USING_ANDROID_DEVICE.lock`.
+
+The reservation is a maximum 30-minute device lease. It exists only to prevent
+simultaneous Android commands against the same device; it must not serialize
+whole QA tickets. Kasanova QA claims it immediately before Android work,
+releases it before any waiting or terminal disposition, and may reclaim an
+expired lease through `/opt/paperclip-watcher/android-device-lock.mjs`.
+Unrelated QA issues must never use the lease holder as a first-class blocker.

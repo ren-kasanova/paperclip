@@ -66,6 +66,27 @@ const SYSTEM_READ_PATHS = [
 const PROXY_ENV_KEYS = ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"] as const;
 const SANDBOX_PROXY_PORT = 31_337;
 
+export async function removeLocalProcessSandboxTempDir(
+  tempDir: string,
+  maxAttempts = 5,
+): Promise<void> {
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      await fs.rm(tempDir, { recursive: true, force: true });
+      return;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException)?.code;
+      if (
+        attempt === maxAttempts ||
+        !["EBUSY", "ENOTEMPTY", "EPERM"].includes(String(code))
+      ) {
+        throw error;
+      }
+      await new Promise((resolve) => setTimeout(resolve, attempt * 50));
+    }
+  }
+}
+
 function normalizeAbsolutePath(candidate: string, label: string): string {
   const trimmed = candidate.trim();
   if (!trimmed || !path.isAbsolute(trimmed)) {
@@ -359,7 +380,7 @@ export async function buildLocalProcessSandboxSpawnTarget(input: {
         TEMP: tempDir,
       },
       cleanup: async () => {
-        await fs.rm(tempDir, { recursive: true, force: true });
+        await removeLocalProcessSandboxTempDir(tempDir);
       },
     };
   }
@@ -404,7 +425,7 @@ export async function buildLocalProcessSandboxSpawnTarget(input: {
       const bridgePath = path.join(tempDir, "bridge.cjs");
       await fs.writeFile(bridgePath, await createNetworkProxyBridge(), { mode: 0o500 });
       const proxy = await startNetworkAllowlistProxy(input.options.networkAllowlist ?? [], socketPath).catch(async (error) => {
-        await fs.rm(tempDir, { recursive: true, force: true });
+        await removeLocalProcessSandboxTempDir(tempDir);
         throw error;
       });
       await mount(tempDir, "rw");
@@ -412,7 +433,7 @@ export async function buildLocalProcessSandboxSpawnTarget(input: {
       executableArgs = [bridgePath, socketPath, input.executable, ...input.args];
       cleanup = async () => {
         await proxy.close();
-        await fs.rm(tempDir, { recursive: true, force: true });
+        await removeLocalProcessSandboxTempDir(tempDir);
       };
     }
   } else {
@@ -423,14 +444,14 @@ export async function buildLocalProcessSandboxSpawnTarget(input: {
       const bridgePath = path.join(tempDir, "bridge.cjs");
       await fs.writeFile(bridgePath, await createNetworkProxyBridge(), { mode: 0o500 });
       const proxy = await startNetworkAllowlistProxy(input.options.networkAllowlist ?? [], socketPath).catch(async (error) => {
-        await fs.rm(tempDir, { recursive: true, force: true });
+        await removeLocalProcessSandboxTempDir(tempDir);
         throw error;
       });
       executable = process.execPath;
       executableArgs = [bridgePath, socketPath, input.executable, ...input.args];
       cleanup = async () => {
         await proxy.close();
-        await fs.rm(tempDir, { recursive: true, force: true });
+        await removeLocalProcessSandboxTempDir(tempDir);
       };
     }
   }

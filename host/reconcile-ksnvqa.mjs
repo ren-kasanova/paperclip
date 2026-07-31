@@ -18,6 +18,14 @@ const ids = {
     fallback: "9a48acd0-3ac3-4f62-b685-2f7411bb0de4",
   },
   fallbackTrigger: "e9b7b55b-c4f3-45e0-8987-e1568f1dba65",
+  secrets: {
+    codemagic: "71a00733-ecb1-4fe9-abe5-09c8caa04dc7",
+    publicProd: "321e688b-680b-44f5-9c85-243147ee1e05",
+    grafana: "87423999-870b-49b3-946e-8596741772dc",
+    amplitudeApi: "c7797942-e03f-486c-82bf-33dcaed5a4bb",
+    amplitudeSecret: "78de38d8-8f1c-4593-bd43-b9b4968d20fd",
+    androidPin: "81c3f596-20d5-48a8-8585-aade27ff5a18",
+  },
 };
 
 const sourceVariables = [
@@ -94,6 +102,16 @@ async function patch(path, body, label) {
 
 function plain(value) {
   return { type: "plain", value };
+}
+
+function secretRef(secretId) {
+  return {
+    type: "secret_ref",
+    version: "latest",
+    secretId,
+    projectionClass: "unclassified",
+    projectionAllowlistKey: null,
+  };
 }
 
 async function reconcileAgent(agentId, mutate, label, mutateRuntime = null) {
@@ -247,6 +265,18 @@ await reconcileAgent(
     config.env.ODESSA_ANDROID_DEVICE_LOCK = plain(
       "/odessa-root/USING_ANDROID_DEVICE.lock",
     );
+    config.env.CODEMAGIC_API_TOKEN = secretRef(ids.secrets.codemagic);
+    config.env.KASANOVA_PUBLIC_PROD_API_URL = plain(
+      "https://api.kasanova.io",
+    );
+    config.env.KASANOVA_PUBLIC_PROD_QA_API_KEY = secretRef(
+      ids.secrets.publicProd,
+    );
+    config.env.GRAFANA_URL = plain("https://grafana.kasanova.io/api");
+    config.env.GRAFANA_API_KEY = secretRef(ids.secrets.grafana);
+    config.env.AMPLITUDE_API_KEY = secretRef(ids.secrets.amplitudeApi);
+    config.env.AMPLITUDE_SECRET_KEY = secretRef(ids.secrets.amplitudeSecret);
+    config.env.KSNVQA_ANDROID_DEVICE_PIN = secretRef(ids.secrets.androidPin);
     // Ren explicitly authorized Kasanova QA on 2026-07-30 to bypass Codex's
     // unavailable nested sandbox/approval layer. Paperclip Landlock remains
     // the mandatory filesystem boundary, and governed effects still route
@@ -259,7 +289,15 @@ await reconcileAgent(
     config.filesystemSandboxBackend = "landlock";
     config.filesystemSandboxCommand = "/usr/local/bin/paperclip-landlock";
     config.filesystemExtraPaths = [
-      { path: "/odessa-root/USING_ANDROID_DEVICE.lock", access: "ro" },
+      { path: "/odessa-root/USING_ANDROID_DEVICE.lock", access: "rw" },
+      {
+        path: "/opt/paperclip-watcher/android-device-lock.mjs",
+        access: "ro",
+      },
+      {
+        path: "/tmp/paperclip-android-device-lock",
+        access: "rw",
+      },
       {
         path: "/Volumes/OdessaExt/Paperclip/companies/KSNVQA",
         access: "ro",
@@ -268,6 +306,16 @@ await reconcileAgent(
     return config;
   },
   "Kasanova QA agent",
+  (runtime) => {
+    runtime.heartbeat = {
+      ...(runtime.heartbeat || {}),
+      // Kasanova has one shared Android execution lane. Event wakes may queue,
+      // but concurrent QA runs would only contend for the same device and
+      // turn transient leases into false blockers.
+      maxConcurrentRuns: 1,
+    };
+    return runtime;
+  },
 );
 
 await reconcileAgent(

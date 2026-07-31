@@ -90,6 +90,9 @@ continuously.
   details.
 - Resolve the Android lock from `ODESSA_ANDROID_DEVICE_LOCK` and ADB from
   `ADB_SERVER_SOCKET`. Do not create an interaction to authorize device use.
+- Device absence, boot, or contention is never a QA blocker. Release the
+  lease, retain an executable issue state, and attach a five-minute
+  run-scoped retry. The host Android provider supplies the headless fallback.
 - Every Ren-facing interaction must name a concrete state-changing,
   provisioning, destructive, financial, security-sensitive, publication,
   merge, deployment, or production effect. An interaction cannot authorize a

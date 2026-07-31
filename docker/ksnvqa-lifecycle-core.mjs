@@ -352,3 +352,63 @@ export function productionApprovalTargetViolation(
     ? `Production promotion approval is missing: ${missing.join(", ")}.`
     : null;
 }
+
+function sameInteractionTarget(left, right) {
+  const leftTarget = left?.payload?.target;
+  const rightTarget = right?.payload?.target;
+  return (
+    leftTarget?.type === "custom" &&
+    rightTarget?.type === "custom" &&
+    String(leftTarget.key || "") === String(rightTarget.key || "") &&
+    String(leftTarget.revisionId || "") ===
+      String(rightTarget.revisionId || "")
+  );
+}
+
+export function productionInteractionStaleReason(
+  interaction,
+  siblingInteractions = [],
+  linearState = null,
+) {
+  if (!isProductionPromotionInteraction(interaction)) return null;
+  if (linearState && linearState !== "Ready for Release") {
+    return `The source Linear issue is ${linearState}, not Ready for Release; this production confirmation is obsolete.`;
+  }
+  const acceptedDuplicate = (siblingInteractions || []).find(
+    (candidate) =>
+      candidate?.id !== interaction?.id &&
+      candidate?.kind === "request_confirmation" &&
+      candidate?.status === "accepted" &&
+      isProductionPromotionInteraction(candidate) &&
+      sameInteractionTarget(candidate, interaction),
+  );
+  if (acceptedDuplicate) {
+    return `The same immutable production target was already accepted by interaction ${acceptedDuplicate.id}; this duplicate has no target drift.`;
+  }
+  const text = [
+    interaction?.title,
+    interaction?.summary,
+    interaction?.payload?.prompt,
+    interaction?.payload?.detailsMarkdown,
+  ]
+    .filter(Boolean)
+    .join(" ");
+  if (
+    /\b(?:after|once|upon)\b.{0,80}\bprovision(?:ed|ing)?\b/i.test(text) ||
+    /\bprovision(?:ed|ing)?\b.{0,80}\b(?:credential|access|secret|token)\b/i.test(
+      text,
+    )
+  ) {
+    return "Production approval and credential provisioning must be separate interactions; this bundled confirmation is obsolete.";
+  }
+  return null;
+}
+
+export function monitorNeedsTerminalCleanup(issue, targetStatus) {
+  return (
+    issue?.status !== targetStatus ||
+    issue?.assigneeAgentId != null ||
+    issue?.assigneeUserId != null ||
+    issue?.executionPolicy != null
+  );
+}

@@ -20,7 +20,9 @@ import {
   lifecycleHealthStatus,
   migrateLifecycleState,
   monitorHasLivePath,
+  monitorNeedsTerminalCleanup,
   productionApprovalTargetViolation,
+  productionInteractionStaleReason,
   rejectionCycleMarker,
   stageDispatchKey,
 } from "./ksnvqa-lifecycle-core.mjs";
@@ -101,6 +103,7 @@ const stages = [
 
 const stateFile = path.join(config.stateDir, "state.json");
 const healthFile = path.join(config.stateDir, "health.json");
+const deliveryTreeFile = path.join(config.stateDir, "delivery-tree.json");
 const lockFile = path.join(config.stateDir, "watcher.lock");
 const lockStaleMs = 5 * 60 * 1000;
 
@@ -117,6 +120,57 @@ async function writeJsonAtomic(file, value) {
   const temporary = `${file}.tmp`;
   await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
   await rename(temporary, file);
+}
+
+function buildDeliveryTreeSnapshot(lifecycleIssues, inProgressIssues, now) {
+  const rejectedByIssueId = new Map();
+  for (const observation of extractUnresolvedRejections(inProgressIssues)) {
+    const existing = rejectedByIssueId.get(observation.issue.id);
+    const observedAt =
+      observation.comment.updatedAt ||
+      observation.comment.createdAt ||
+      observation.issue.updatedAt;
+    const existingAt =
+      existing?.qaRejection?.observedAt ||
+      existing?.updatedAt;
+    if (existing && Date.parse(existingAt || "") >= Date.parse(observedAt || "")) {
+      continue;
+    }
+    rejectedByIssueId.set(observation.issue.id, {
+      linearIssueId: observation.issue.id,
+      identifier: observation.issue.identifier,
+      title: observation.issue.title,
+      url: observation.issue.url,
+      state: "In Progress",
+      updatedAt: observation.issue.updatedAt,
+      qaRejection: {
+        commentId: observation.comment.id,
+        observedAt,
+      },
+    });
+  }
+
+  const tickets = [
+    ...lifecycleIssues.map((issue) => ({
+      linearIssueId: issue.id,
+      identifier: issue.identifier,
+      title: issue.title,
+      url: issue.url,
+      state: issue.stage.state,
+      updatedAt: issue.updatedAt,
+      enteredAt: issue.updatedAt,
+    })),
+    ...rejectedByIssueId.values(),
+  ].sort((left, right) =>
+    left.identifier.localeCompare(right.identifier, undefined, { numeric: true }),
+  );
+
+  return {
+    version: 1,
+    source: "linear-kasanova",
+    fetchedAt: now,
+    tickets,
+  };
 }
 
 async function acquireLock() {
@@ -875,12 +929,14 @@ async function enforceRejectionCycles(
         cycle.attemptInvariantIssueId = invariant.id;
         cycle.attemptInvariantIdentifier = invariant.identifier;
       }
-      await patchIssue(monitor.id, {
-        status: "blocked",
-        assigneeAgentId: null,
-        assigneeUserId: null,
-        executionPolicy: null,
-      });
+      if (monitorNeedsTerminalCleanup(detailedMonitor, "blocked")) {
+        await patchIssue(monitor.id, {
+          status: "blocked",
+          assigneeAgentId: null,
+          assigneeUserId: null,
+          executionPolicy: null,
+        });
+      }
       cycles[comment.id] = cycle;
       continue;
     }
@@ -1088,14 +1144,16 @@ async function enforceDeliveryMonitorInvariant(
             ].join("\n"),
           );
         }
-        await patchIssue(issue.id, {
-          status: "done",
-          assigneeAgentId: null,
-          assigneeUserId: null,
-          executionPolicy: null,
-        });
+        if (monitorNeedsTerminalCleanup(detailedIssue, "done")) {
+          await patchIssue(issue.id, {
+            status: "done",
+            assigneeAgentId: null,
+            assigneeUserId: null,
+            executionPolicy: null,
+          });
+          closed.push(issue.identifier);
+        }
         delete notifications[issue.id];
-        closed.push(issue.identifier);
         continue;
       }
       const monitorState = detailedIssue.executionState?.monitor || {};
@@ -1163,14 +1221,16 @@ async function enforceDeliveryMonitorInvariant(
             "A source-bound invariant task now owns recovery; this monitor will not re-arm automatically.",
           ].join("\n"),
         );
-        await patchIssue(issue.id, {
-          status: "blocked",
-          assigneeAgentId: null,
-          assigneeUserId: null,
-          executionPolicy: null,
-        });
+        if (monitorNeedsTerminalCleanup(detailedIssue, "blocked")) {
+          await patchIssue(issue.id, {
+            status: "blocked",
+            assigneeAgentId: null,
+            assigneeUserId: null,
+            executionPolicy: null,
+          });
+          stopped.push(issue.identifier);
+        }
         delete notifications[issue.id];
-        stopped.push(issue.identifier);
         violations.push(reason);
         continue;
       }
@@ -1302,7 +1362,10 @@ function forbiddenConfirmationReason(interaction) {
   return null;
 }
 
-async function enforceInteractionPolicy(previousHandled) {
+async function enforceInteractionPolicy(
+  previousHandled,
+  linearStateByIdentifier,
+) {
   const handled = Object.fromEntries(
     Object.entries(previousHandled || {}).filter(
       ([, timestamp]) =>
@@ -1335,6 +1398,8 @@ async function enforceInteractionPolicy(previousHandled) {
     const preauthorizationReason =
       forbiddenConfirmationReason(interaction);
     let productionViolation = null;
+    let staleReason = null;
+    let expectedIdentifier = null;
     let reason = null;
     if (productionPromotion) {
       let issue = issueCache.get(issueId);
@@ -1342,8 +1407,16 @@ async function enforceInteractionPolicy(previousHandled) {
         issue = await fetchPaperclipIssue(issueId);
         issueCache.set(issueId, issue);
       }
-      const expectedIdentifier =
+      expectedIdentifier =
         String(issue?.title || "").match(/^\[(KSNV-\d+)\]/)?.[1] || null;
+      const sourceLinearState = expectedIdentifier
+        ? linearStateByIdentifier?.get(expectedIdentifier) || null
+        : null;
+      staleReason = productionInteractionStaleReason(
+        interaction,
+        interactions,
+        sourceLinearState,
+      );
       productionViolation = productionApprovalTargetViolation(
         interaction,
         expectedIdentifier,
@@ -1352,6 +1425,7 @@ async function enforceInteractionPolicy(previousHandled) {
         preauthorizationReason ===
         "Read-only operations are preauthorized and cannot request approval.";
       reason =
+        staleReason ||
         absoluteReason ||
         (readOnlyPreauthorization ? preauthorizationReason : null) ||
         productionViolation;
@@ -1359,15 +1433,12 @@ async function enforceInteractionPolicy(previousHandled) {
       reason = preauthorizationReason;
     }
     if (!reason) continue;
-    await fetchJson(
-      `${config.paperclipApiUrl}/issues/${issueId}/interactions/${interactionId}/reject`,
-      {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ reason }),
-      },
-    );
-    const remediation = absoluteReason
+    const remediation = staleReason
+      ? [
+          "- No decision is required from Ren.",
+          "- Re-entering `Ready for Release` must create a fresh target-bound confirmation only when the immutable target has changed or no prior acceptance covers it.",
+        ]
+      : absoluteReason
       ? [
           "- Do not continue the browser operation.",
           "- Browser access requires Ren's exact phrase `USA EL NAVEGADOR` in the current message; a Paperclip interaction cannot substitute for it.",
@@ -1383,16 +1454,50 @@ async function enforceInteractionPolicy(previousHandled) {
           "- If a real dependency is missing, request only the concrete provisioning.",
           "- Browser access still requires Ren's exact current-message phrase `USA EL NAVEGADOR`.",
         ];
-    await postIssueComment(
-      issueId,
-      [
-        "## Invalid confirmation rejected",
-        "",
-        reason,
-        "",
-        ...remediation,
-      ].join("\n"),
-    );
+    const commentBody = [
+      staleReason
+        ? "## Stale confirmation retired"
+        : "## Invalid confirmation rejected",
+      "",
+      reason,
+      "",
+      ...remediation,
+    ].join("\n");
+    if (staleReason) {
+      if (
+        expectedIdentifier &&
+        linearStateByIdentifier?.get(expectedIdentifier) &&
+        linearStateByIdentifier.get(expectedIdentifier) !== "Ready for Release"
+      ) {
+        await patchIssue(issueId, {
+          status: "cancelled",
+          assigneeAgentId: null,
+        });
+      }
+      // Paperclip confirmations deliberately have no direct cancellation
+      // endpoint. A board comment is the canonical supersession mechanism for
+      // interactions created with supersedeOnUserComment=true.
+      await postIssueComment(issueId, commentBody);
+      const refreshed = await fetchIssueInteractions(issueId);
+      if (
+        refreshed.find((entry) => entry?.id === interactionId)?.status ===
+        "pending"
+      ) {
+        throw new Error(
+          `Stale interaction ${interactionId} did not supersede after the board comment`,
+        );
+      }
+    } else {
+      await fetchJson(
+        `${config.paperclipApiUrl}/issues/${issueId}/interactions/${interactionId}/reject`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ reason }),
+        },
+      );
+      await postIssueComment(issueId, commentBody);
+    }
     handled[interactionId] = new Date().toISOString();
     withdrawn += 1;
   }
@@ -1471,6 +1576,12 @@ async function pollLifecycle() {
     : null;
   const issues = await fetchLifecycleIssues();
   const inProgressIssues = await fetchInProgressIssuesWithComments();
+  const linearStateByIdentifier = new Map(
+    [...issues, ...inProgressIssues].map((issue) => [
+      issue.identifier,
+      issue.stage?.state || issue.state?.name || null,
+    ]),
+  );
   const trackedCycleIssues = await fetchTrackedCycleIssuesWithComments(
     previous?.rejectionCycles,
     new Set(inProgressIssues.map((issue) => issue.id)),
@@ -1562,7 +1673,10 @@ async function pollLifecycle() {
       {},
       rejectionResult.cycles,
     );
-    const interactionResult = await enforceInteractionPolicy({});
+    const interactionResult = await enforceInteractionPolicy(
+      {},
+      linearStateByIdentifier,
+    );
     await writeJsonAtomic(stateFile, {
       version: 5,
       initializedAt: now,
@@ -1599,6 +1713,10 @@ async function pollLifecycle() {
       inProgressCount: inProgressIssues.length,
       inProgressIdentifiers: inProgressIssues.map((issue) => issue.identifier),
     });
+    await writeJsonAtomic(
+      deliveryTreeFile,
+      buildDeliveryTreeSnapshot(issues, inProgressIssues, now),
+    );
     process.stdout.write(
       `${now} initialized lifecycle watcher with ${issues.length} Kasanova issue(s), ${dispatched} non-Done dispatch(es)\n`,
     );
@@ -1718,6 +1836,7 @@ async function pollLifecycle() {
   );
   const interactionResult = await enforceInteractionPolicy(
     previous.withdrawnPolicyInteractions,
+    linearStateByIdentifier,
   );
 
   await writeJsonAtomic(stateFile, {
@@ -1759,6 +1878,10 @@ async function pollLifecycle() {
     inProgressCount: inProgressIssues.length,
     inProgressIdentifiers: inProgressIssues.map((issue) => issue.identifier),
   });
+  await writeJsonAtomic(
+    deliveryTreeFile,
+    buildDeliveryTreeSnapshot(issues, inProgressIssues, now),
+  );
   process.stdout.write(
     `${now} lifecycle poll complete: ${issues.length} active, ${dispatched} dispatched, ${guarded} guarded\n`,
   );

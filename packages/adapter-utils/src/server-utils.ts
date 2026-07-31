@@ -3016,6 +3016,17 @@ export async function ensureCommandResolvable(
   throw new Error(`Command not found in PATH: "${command}"`);
 }
 
+export async function settleRunProcessCleanup(
+  cleanup: (() => Promise<void>) | undefined,
+  onError: (error: unknown) => void,
+): Promise<void> {
+  try {
+    await cleanup?.();
+  } catch (error) {
+    onError(error);
+  }
+}
+
 export async function runChildProcess(
   runId: string,
   command: string,
@@ -3066,6 +3077,14 @@ export async function runChildProcess(
       localProcessSandbox: opts.localProcessSandbox ?? null,
     })
       .then((target) => {
+        const cleanupTarget = () =>
+          settleRunProcessCleanup(target.cleanup, (error) => {
+            onLogError(
+              error,
+              runId,
+              "failed to clean up the local process sandbox",
+            );
+          });
         const childEnv = { ...mergedEnv, ...target.env };
         for (const [key, value] of Object.entries(childEnv)) {
           if (value === undefined) delete childEnv[key];
@@ -3204,7 +3223,7 @@ export async function runChildProcess(
           if (timeout) clearTimeout(timeout);
           clearTerminalCleanupTimers();
           runningProcesses.delete(runId);
-          void target.cleanup?.();
+          void cleanupTarget();
           const errno = (err as NodeJS.ErrnoException).code;
           const pathValue = mergedEnv.PATH ?? mergedEnv.Path ?? "";
           const msg =
@@ -3224,7 +3243,7 @@ export async function runChildProcess(
           runningProcesses.delete(runId);
           void logChain.finally(() => {
             void Promise.resolve()
-              .then(() => target.cleanup?.())
+              .then(cleanupTarget)
               .finally(() => {
               resolve({
                 exitCode: code,

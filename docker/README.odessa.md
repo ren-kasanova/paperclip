@@ -49,6 +49,11 @@ rejection evidence always has a durable destination: an open source task gets
 one marker-guarded warning, otherwise the watcher creates one source-bound QA
 evidence-repair task.
 
+Terminal monitor reconciliation is idempotent. Once status, assignees, and
+execution policy already match the terminal disposition, the minute watcher
+does not PATCH the issue again. This prevents no-op `None → done` activity
+entries from being emitted on every poll.
+
 An existing future monitor deadline, active execution, recent wake/trigger, or
 pending interaction is a live delivery path. The minute watcher does not
 rewrite a live deadline, which prevents a frequent poll from postponing the
@@ -72,6 +77,38 @@ subjects. Production-promotion confirmations additionally require an immutable
 custom target containing the KSNV key, exact release path, artifact/release
 revision, digest, and rollback evidence. Valid state-changing confirmations
 remain pending for Ren and are routed by DECK·7.
+
+Pending production confirmations are cancelled automatically when the source
+Linear issue is no longer `Ready for Release`, when Ren already accepted the
+same immutable target, or when a card improperly bundles credential
+provisioning with promotion. The watcher posts the canonical board supersession
+comment, which expires the pending confirmation as `superseded_by_comment`; it
+does not reject Ren's prior decision. A later `Ready for Release` entry may ask
+again only for a changed immutable target or when no prior acceptance covers
+it. When the source issue has left `Ready for Release`, the obsolete Paperclip
+stage execution is also cancelled and unassigned so it cannot wake again.
+
+The global Android reservation is a concurrent-command lease, not a workflow
+dependency. The host lock file is mounted as the one writable overlay inside
+the otherwise read-only OdessaExt mount. Kasanova QA must use
+`/opt/paperclip-watcher/android-device-lock.mjs` to claim at most 30 minutes,
+refresh only during active device work, release before waiting or exiting, and
+reclaim expired leases. The helper serializes lock updates, and no Paperclip
+issue may block an unrelated QA issue on device ownership. Its shared update
+guard lives at `/tmp/paperclip-android-device-lock`, which the entrypoint
+creates before Paperclip starts and Landlock grants only to Kasanova QA.
+
+Kasanova QA's Codemagic, production Public API, Grafana, Amplitude, and Android
+PIN values are encrypted Paperclip company secrets bound by
+`host/reconcile-ksnvqa.mjs`. Agents probe these configured dependencies
+directly and may request provisioning only after a real probe fails; secret
+values never belong in issue comments or the Android lock.
+
+Compose mounts `host/` read-only and runs that reconciler inside the Paperclip
+service after API health is ready and every 60 seconds thereafter. This is a
+zero-token control loop. It reasserts the canonical agent/runtime/routine
+configuration after restarts or board edits, including the Android helper
+Landlock grant and `maxConcurrentRuns: 1` for the single shared device lane.
 
 The server reads only a copy of the relay credential from the external
 `paperclip_odessa_deck7_router` volume. Colima does not reliably project the
@@ -109,10 +146,17 @@ Compose allows a 90-second healthcheck start period for the first heartbeat.
 Paperclip issue and comment reads are fully paginated. Routine-execution rows
 are excluded from the minute watcher scan so historical fallback runs cannot
 push an idle Delivery monitor out of view. `host/reconcile-ksnvqa.mjs --check`
-audits all pages of the project, the five-minute intake runtime, routine titles
+audits all pages of the project, the one-minute intake runtime, routine titles
 and variables, the `0 */8 * * *` `America/Monterrey` fallback trigger, and
 source-bound Paperclip titles.
 
 Watcher `degraded` means the poll completed but lifecycle work needs attention;
 the healthcheck accepts it as a live control plane. Only `error`, an invalid
 record, or a stale poll marks the Paperclip container unhealthy.
+The macOS host also runs two first-class launch services:
+
+- `com.odessa.paperclip-adb-bridge` exposes the private ADB server to Colima.
+- `com.odessa.paperclip-android-provider` keeps a headless `ksnv_api36`
+  fallback emulator available on that server whenever the global Android
+  lease is free. Temporary device boot, absence, and contention must use a
+  five-minute run-scoped retry and must never move QA to `blocked`.

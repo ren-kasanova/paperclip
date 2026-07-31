@@ -10,8 +10,10 @@ import {
   isProductionPromotionInteraction,
   lifecycleHealthStatus,
   migrateLifecycleState,
+  monitorNeedsTerminalCleanup,
   monitorHasLivePath,
   productionApprovalTargetViolation,
+  productionInteractionStaleReason,
   rejectionCompleteness,
   rejectionCycleMarker,
   stageDispatchKey,
@@ -416,4 +418,107 @@ test("development delivery is not production promotion when production is exclud
     }),
     null,
   );
+});
+
+test("production confirmation is stale when Linear leaves Ready for Release", () => {
+  const interaction = {
+    id: "pending",
+    kind: "request_confirmation",
+    status: "pending",
+    title: "Approve production promotion for KSNV-230",
+    payload: {
+      target: {
+        type: "custom",
+        key: "KSNV-230:production-promotion:freeze-control",
+        revisionId: "sha256:abc",
+      },
+    },
+  };
+  assert.match(
+    productionInteractionStaleReason(interaction, [], "In Progress"),
+    /not Ready for Release/,
+  );
+  assert.equal(
+    productionInteractionStaleReason(interaction, [], "Ready for Release"),
+    null,
+  );
+});
+
+test("duplicate accepted immutable production targets are retired", () => {
+  const target = {
+    type: "custom",
+    key: "KSNV-230:production-promotion:freeze-control",
+    revisionId: "sha256:abc",
+  };
+  const pending = {
+    id: "pending",
+    kind: "request_confirmation",
+    status: "pending",
+    title: "Approve production promotion for KSNV-230",
+    payload: { target },
+  };
+  const accepted = {
+    id: "accepted",
+    kind: "request_confirmation",
+    status: "accepted",
+    title: "Approve production promotion for KSNV-230",
+    payload: { target: { ...target } },
+  };
+  assert.match(
+    productionInteractionStaleReason(
+      pending,
+      [accepted, pending],
+      "Ready for Release",
+    ),
+    /already accepted/,
+  );
+});
+
+test("production approvals cannot bundle credential provisioning", () => {
+  const interaction = {
+    id: "bundled",
+    kind: "request_confirmation",
+    status: "pending",
+    title: "Approve production promotion",
+    payload: {
+      prompt: "After securely provisioning Codemagic access, approve promotion.",
+    },
+  };
+  assert.match(
+    productionInteractionStaleReason(
+      interaction,
+      [interaction],
+      "Ready for Release",
+    ),
+    /must be separate/,
+  );
+});
+
+test("terminal monitor cleanup is idempotent", () => {
+  const terminal = {
+    status: "done",
+    assigneeAgentId: null,
+    assigneeUserId: null,
+    executionPolicy: null,
+    executionState: {
+      status: "idle",
+      monitor: { status: "cleared" },
+    },
+  };
+  assert.equal(monitorNeedsTerminalCleanup(terminal, "done"), false);
+  assert.equal(
+    monitorNeedsTerminalCleanup(
+      { ...terminal, assigneeAgentId: "delivery-agent" },
+      "done",
+    ),
+    true,
+  );
+  assert.equal(
+    monitorNeedsTerminalCleanup(
+      { ...terminal, executionPolicy: { monitor: {} } },
+      "done",
+    ),
+    true,
+  );
+  assert.equal(monitorNeedsTerminalCleanup(terminal, "blocked"), true);
 });

@@ -81,6 +81,10 @@
   "android": {
     "hostLockPath": "/Volumes/OdessaExt/USING_ANDROID_DEVICE.lock",
     "containerLockPath": "/odessa-root/USING_ANDROID_DEVICE.lock",
-    "adbServerSocket": "tcp:host.docker.internal:5038"
+    "leaseCommand": "/opt/paperclip-watcher/android-device-lock.mjs",
+    "leaseGuardPath": "/tmp/paperclip-android-device-lock",
+    "maxLeaseMinutes": 30,
+    "adbServerSocket": "tcp:host.docker.internal:5038",
+    "maxConcurrentRuns": 1
   }
 }

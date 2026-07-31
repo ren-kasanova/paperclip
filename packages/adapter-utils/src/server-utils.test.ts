@@ -16,6 +16,7 @@ import {
   renderPaperclipWakePrompt,
   runningProcesses,
   runChildProcess,
+  settleRunProcessCleanup,
   sanitizeSshRemoteEnv,
   signalRunningProcess,
   shapePaperclipWorkspaceEnvForExecution,
@@ -390,6 +391,20 @@ describe("adapter skill snapshots", () => {
 });
 
 describe("runChildProcess", () => {
+  it("settles sandbox cleanup failures without rejecting the process result", async () => {
+    const cleanupError = new Error("cleanup race");
+    const observed: unknown[] = [];
+    await expect(
+      settleRunProcessCleanup(
+        async () => {
+          throw cleanupError;
+        },
+        (error) => observed.push(error),
+      ),
+    ).resolves.toBeUndefined();
+    expect(observed).toEqual([cleanupError]);
+  });
+
   it("does not arm a timeout when timeoutSec is 0", async () => {
     const result = await runChildProcess(
       randomUUID(),
