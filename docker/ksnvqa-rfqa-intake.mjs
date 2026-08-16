@@ -24,6 +24,8 @@ import {
   productionApprovalTargetViolation,
   productionInteractionStaleReason,
   rejectionCycleMarker,
+  resolvedLifecycleGuardIssue,
+  resolvedMonitorCardinalityInvariantIssue,
   stageDispatchKey,
 } from "./ksnvqa-lifecycle-core.mjs";
 
@@ -862,6 +864,30 @@ async function enforceRejectionCycles(
       continue;
     }
 
+    const resolvedCardinalityInvariant =
+      resolvedMonitorCardinalityInvariantIssue(cycle, paperclipIssues);
+    if (resolvedCardinalityInvariant) {
+      await patchIssue(resolvedCardinalityInvariant.id, {
+        status: "done",
+        assigneeAgentId: null,
+        assigneeUserId: null,
+        executionPolicy: null,
+      });
+      resolvedCardinalityInvariant.status = "done";
+      resolvedCardinalityInvariant.assigneeAgentId = null;
+      resolvedCardinalityInvariant.assigneeUserId = null;
+      resolvedCardinalityInvariant.executionPolicy = null;
+      repaired.push(
+        `${resolvedCardinalityInvariant.identifier}:resolved-monitor-cardinality:${comment.id}`,
+      );
+    }
+    if (cycle.invariantIssueId) {
+      delete cycle.invariantIssueId;
+      delete cycle.invariantIdentifier;
+      delete cycle.invariantViolation;
+      delete cycle.paperclipIssueIds;
+    }
+
     const monitor = candidates[0];
     cycle.monitorIssueId = monitor.id;
     cycle.monitorIdentifier = monitor.identifier;
@@ -968,6 +994,35 @@ async function enforceRejectionCycles(
   }
 
   for (const [commentId, cycle] of Object.entries(cycles)) {
+    if (cycle.identifier && cycle.invariantIssueId) {
+      const currentMonitors = deliveryMonitorCandidates(
+        paperclipIssues,
+        cycle.identifier,
+      );
+      if (currentMonitors.length === 1) {
+        const resolvedCardinalityInvariant =
+          resolvedMonitorCardinalityInvariantIssue(cycle, paperclipIssues);
+        if (resolvedCardinalityInvariant) {
+          await patchIssue(resolvedCardinalityInvariant.id, {
+            status: "done",
+            assigneeAgentId: null,
+            assigneeUserId: null,
+            executionPolicy: null,
+          });
+          resolvedCardinalityInvariant.status = "done";
+          resolvedCardinalityInvariant.assigneeAgentId = null;
+          resolvedCardinalityInvariant.assigneeUserId = null;
+          resolvedCardinalityInvariant.executionPolicy = null;
+          repaired.push(
+            `${resolvedCardinalityInvariant.identifier}:resolved-monitor-cardinality:${commentId}`,
+          );
+          delete cycle.invariantIssueId;
+          delete cycle.invariantIdentifier;
+          delete cycle.invariantViolation;
+          delete cycle.paperclipIssueIds;
+        }
+      }
+    }
     if (detectedIds.has(commentId)) continue;
     if (
       String(cycle.status || "").startsWith("resolved_") ||
@@ -1741,12 +1796,29 @@ async function pollLifecycle() {
     const forcedReadyForQaReentry =
       issue.stage.state === "Ready for QA" &&
       newlyResolvedReadyForQa.has(issue.id);
-    if (existing?.state === issue.stage.state && !forcedReadyForQaReentry) {
+    const key = historyKey(issue);
+    let entries = transitionHistory[key] || [];
+    const resolvedGuard = guardNotifications[key]
+      ? resolvedLifecycleGuardIssue(
+          guardNotifications[key],
+          paperclipIssues,
+          issue.identifier,
+        )
+      : null;
+    if (resolvedGuard) {
+      delete guardNotifications[key];
+      transitionHistory[key] = [];
+      entries = [];
+    }
+    const expiredGuard = existing?.guardedAt && resolvedGuard;
+    if (
+      existing?.state === issue.stage.state &&
+      !forcedReadyForQaReentry &&
+      !expiredGuard
+    ) {
       nextActive[issue.id] = existing;
       continue;
     }
-    const key = historyKey(issue);
-    const entries = transitionHistory[key] || [];
     if (entries.length >= config.maxStageEntries) {
       if (!guardNotifications[key]) {
         try {
@@ -1781,6 +1853,7 @@ async function pollLifecycle() {
       };
       transitionHistory[key] = [...entries, now];
       entrySequences[key] = entrySequence;
+      delete guardNotifications[key];
       if (forcedReadyForQaReentry) {
         const resolutionCommentId =
           newlyResolvedReadyForQa.get(issue.id);

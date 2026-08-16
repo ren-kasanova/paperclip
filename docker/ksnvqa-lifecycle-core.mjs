@@ -108,8 +108,22 @@ export function deliveryMonitorCandidates(paperclipIssues, identifier) {
     (issue) =>
       typeof issue?.title === "string" &&
       issue.title.startsWith(prefix) &&
-      issue.title.endsWith("— Delivery QA-return monitor"),
+      issue.title.endsWith("— Delivery QA-return monitor") &&
+      monitorNeedsTerminalCleanup(issue, "done"),
   );
+}
+
+export function resolvedMonitorCardinalityInvariantIssue(
+  cycle,
+  paperclipIssues,
+) {
+  const invariantIssueId = cycle?.invariantIssueId;
+  if (!invariantIssueId) return null;
+  const issue = (paperclipIssues || []).find(
+    (candidate) => candidate?.id === invariantIssueId,
+  );
+  if (!issue || !monitorNeedsTerminalCleanup(issue, "done")) return null;
+  return issue;
 }
 
 export function monitorHasLivePath(
@@ -411,4 +425,35 @@ export function monitorNeedsTerminalCleanup(issue, targetStatus) {
     issue?.assigneeUserId != null ||
     issue?.executionPolicy != null
   );
+}
+
+export function resolvedLifecycleGuardIssue(
+  notification,
+  paperclipIssues,
+  identifier,
+) {
+  const notifiedAt =
+    typeof notification === "string"
+      ? notification
+      : notification?.notifiedAt;
+  const notifiedMs = Date.parse(notifiedAt || "");
+  if (!Number.isFinite(notifiedMs)) return null;
+  const prefix = `[${identifier}]`;
+  return [...(paperclipIssues || [])]
+    .filter((issue) => {
+      const updatedMs = Date.parse(issue?.updatedAt || "");
+      return (
+        typeof issue?.title === "string" &&
+        issue.title.startsWith(prefix) &&
+        issue.title.endsWith("— lifecycle churn guard") &&
+        issue.status === "done" &&
+        Number.isFinite(updatedMs) &&
+        updatedMs >= notifiedMs
+      );
+    })
+    .sort((left, right) =>
+      String(right.updatedAt || "").localeCompare(
+        String(left.updatedAt || ""),
+      ),
+    )[0] || null;
 }

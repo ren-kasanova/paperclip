@@ -16,6 +16,8 @@ import {
   productionInteractionStaleReason,
   rejectionCompleteness,
   rejectionCycleMarker,
+  resolvedLifecycleGuardIssue,
+  resolvedMonitorCardinalityInvariantIssue,
   stageDispatchKey,
 } from "./ksnvqa-lifecycle-core.mjs";
 
@@ -95,6 +97,68 @@ test("selects only the canonical source-bound delivery monitor", () => {
       "KSNV-188",
     ),
     [monitor],
+  );
+});
+
+test("excludes clean terminal predecessors from delivery monitor cardinality", () => {
+  const title =
+    "[KSNV-188] Marketplace P95 spike — Delivery QA-return monitor";
+  const completed = {
+    title,
+    status: "done",
+    assigneeAgentId: null,
+    assigneeUserId: null,
+    executionPolicy: null,
+  };
+  const active = {
+    title,
+    status: "in_review",
+    assigneeAgentId: "delivery-agent",
+    assigneeUserId: null,
+    executionPolicy: null,
+  };
+  assert.deepEqual(
+    deliveryMonitorCandidates([completed, active], "KSNV-188"),
+    [active],
+  );
+  assert.deepEqual(
+    deliveryMonitorCandidates([completed], "KSNV-188"),
+    [],
+  );
+});
+
+test("retires a linked monitor-cardinality invariant after one monitor remains", () => {
+  const issue = {
+    id: "invariant-1",
+    status: "todo",
+    assigneeAgentId: null,
+    assigneeUserId: "local-board",
+    executionPolicy: null,
+  };
+  assert.equal(
+    resolvedMonitorCardinalityInvariantIssue(
+      { invariantIssueId: "invariant-1" },
+      [issue],
+    ),
+    issue,
+  );
+  assert.equal(
+    resolvedMonitorCardinalityInvariantIssue(
+      { invariantIssueId: "invariant-1" },
+      [
+        {
+          ...issue,
+          status: "done",
+          assigneeUserId: null,
+          executionState: { status: "idle", monitor: { status: "cleared" } },
+        },
+      ],
+    ),
+    null,
+  );
+  assert.equal(
+    resolvedMonitorCardinalityInvariantIssue({}, [issue]),
+    null,
   );
 });
 
@@ -491,6 +555,37 @@ test("production approvals cannot bundle credential provisioning", () => {
       "Ready for Release",
     ),
     /must be separate/,
+  );
+});
+
+test("a completed source guard releases its stale lifecycle latch", () => {
+  const notification = "2026-08-16T06:42:57.922Z";
+  const resolved = {
+    id: "guard-1",
+    identifier: "KSNVQA-548",
+    title: "[KSNV-14] Bug report feature — lifecycle churn guard",
+    status: "done",
+    updatedAt: "2026-08-16T06:45:33.587Z",
+  };
+  assert.equal(
+    resolvedLifecycleGuardIssue(notification, [resolved], "KSNV-14"),
+    resolved,
+  );
+  assert.equal(
+    resolvedLifecycleGuardIssue(
+      notification,
+      [{ ...resolved, status: "todo" }],
+      "KSNV-14",
+    ),
+    null,
+  );
+  assert.equal(
+    resolvedLifecycleGuardIssue(
+      notification,
+      [{ ...resolved, updatedAt: "2026-08-16T06:40:00.000Z" }],
+      "KSNV-14",
+    ),
+    null,
   );
 });
 
