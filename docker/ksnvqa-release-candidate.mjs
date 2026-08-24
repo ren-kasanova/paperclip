@@ -262,6 +262,7 @@ function compensationComplete(candidate) {
         record.restorationTargetMainSha === restorationTargetMainSha &&
         /^[0-9a-f]{40}$/.test(record.restoredMainSha || "") &&
         record.restoredMainSha !== promotedMainSha &&
+        record.restoredMainSha !== restorationTargetMainSha &&
         /^[0-9a-f]{40}$/.test(record.restoredTreeSha || ""),
     );
   });
@@ -589,6 +590,11 @@ export async function recordCompensatingRevert(
     if (restoredMainSha === previousMerge.mergedMainSha) {
       throw new Error(
         `${repository} compensation main must differ from promoted main ${previousMerge.mergedMainSha}`,
+      );
+    }
+    if (restoredMainSha === restorationTargetMainSha) {
+      throw new Error(
+        `${repository} compensation main must differ from historical restoration target ${restorationTargetMainSha}`,
       );
     }
     const repair = structuredClone(existing.repair);

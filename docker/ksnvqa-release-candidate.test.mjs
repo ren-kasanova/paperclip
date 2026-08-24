@@ -287,6 +287,23 @@ test("compensation rejects reuse of the promoted main SHA", async () => {
   });
 });
 
+test("compensation rejects reuse of the historical restoration target as main", async () => {
+  await withLedger(async (file) => {
+    await createReleasedCandidate(file);
+    await repairCandidate(file, repairInput(), timestamps.repaired);
+    const before = await readFile(file, "utf8");
+
+    await assert.rejects(
+      recordCompensatingRevert(
+        file,
+        compensationInput("app", { mainSha: source.appMainSha }),
+      ),
+      /must differ from historical restoration target/,
+    );
+    assert.equal(await readFile(file, "utf8"), before);
+  });
+});
+
 test("identical compensation retries are idempotent and drift fails closed", async () => {
   await withLedger(async (file) => {
     await createReleasedCandidate(file);
