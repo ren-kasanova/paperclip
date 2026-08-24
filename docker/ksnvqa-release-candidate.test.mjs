@@ -1,0 +1,302 @@
+import assert from "node:assert/strict";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import test from "node:test";
+
+import {
+  openCandidate,
+  pinCandidate,
+  readCandidate,
+  recordCandidateMerge,
+  recordCompensatingRevert,
+  releaseCandidate,
+  repairCandidate,
+  stageCandidatePromotion,
+} from "./ksnvqa-release-candidate.mjs";
+
+const owner = {
+  paperclipIssueId: "2b25831a-6390-4161-88a2-ca3947649b3b",
+  paperclipIdentifier: "KSNVQA-856",
+};
+const otherOwner = "9eab523c-d85a-42b3-9d31-89f0f3054cff";
+const tickets = ["KSNV-303", "KSNV-304"];
+const source = {
+  appDevSha: "24a2c051f5cb1eee1493f24055462ffe88be06f2",
+  appMainSha: "43fbc1036be4a14d27f62f0026c51530491a05cb",
+  coreDevSha: "2e97cf1c54ab30aedd48d04b40563f5c2c15aa4a",
+  coreMainSha: "001bd2ab2cbd5107d437b4583780622750757f67",
+  designDevSha: "bab10f059e2ced4c3faf9b4a499bcf59f5f656d7",
+  designMainSha: "13fcb850a9b780b1d2abfe823d7fa100d16e6654",
+};
+const mergedMain = {
+  app: "b244690f04a470f8e44c71665782be0be19b0c61",
+  core: "c006a625da3855ad9d1ad8e8a513815a1f3a4938",
+  design: "4ab146496e158f9271affe5a5ca21f6bffa0e701",
+};
+const timestamps = {
+  opened: "2026-08-24T20:00:00.000Z",
+  pinned: "2026-08-24T20:01:00.000Z",
+  staged: "2026-08-24T20:02:00.000Z",
+  appMerged: "2026-08-24T20:03:00.000Z",
+  coreMerged: "2026-08-24T20:04:00.000Z",
+  designMerged: "2026-08-24T20:05:00.000Z",
+  released: "2026-08-24T20:06:00.000Z",
+  repaired: "2026-08-24T20:07:00.000Z",
+};
+
+async function withLedger(run) {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "ksnvqa-candidate-"));
+  const file = path.join(directory, "candidate.json");
+  try {
+    await run(file);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+}
+
+async function open(file) {
+  return openCandidate(
+    file,
+    {
+      ...owner,
+      tickets,
+    },
+    timestamps.opened,
+  );
+}
+
+async function pin(file) {
+  return pinCandidate(
+    file,
+    {
+      paperclipIssueId: owner.paperclipIssueId,
+      tickets,
+      ...source,
+    },
+    timestamps.pinned,
+  );
+}
+
+async function createReleasedCandidate(file) {
+  await open(file);
+  await pin(file);
+  await stageCandidatePromotion(
+    file,
+    {
+      paperclipIssueId: owner.paperclipIssueId,
+      appPullRequest: "276",
+      appHeadSha: source.appDevSha,
+      corePullRequest: "77",
+      coreHeadSha: source.coreDevSha,
+      designPullRequest: "23",
+      designHeadSha: source.designDevSha,
+    },
+    timestamps.staged,
+  );
+  await recordCandidateMerge(
+    file,
+    {
+      paperclipIssueId: owner.paperclipIssueId,
+      repository: "app",
+      headSha: source.appDevSha,
+      mainSha: mergedMain.app,
+    },
+    timestamps.appMerged,
+  );
+  await recordCandidateMerge(
+    file,
+    {
+      paperclipIssueId: owner.paperclipIssueId,
+      repository: "core",
+      headSha: source.coreDevSha,
+      mainSha: mergedMain.core,
+    },
+    timestamps.coreMerged,
+  );
+  await recordCandidateMerge(
+    file,
+    {
+      paperclipIssueId: owner.paperclipIssueId,
+      repository: "design",
+      headSha: source.designDevSha,
+      mainSha: mergedMain.design,
+    },
+    timestamps.designMerged,
+  );
+  return releaseCandidate(
+    file,
+    { paperclipIssueId: owner.paperclipIssueId },
+    timestamps.released,
+  );
+}
+
+function repairInput(paperclipIssueId = owner.paperclipIssueId) {
+  return {
+    paperclipIssueId,
+    reason: "Compensate the recorded three-repository promotion",
+    rejectionId: "qa-rejected-comment-id",
+    linearIdentifier: "KSNV-303",
+  };
+}
+
+test("owner-matched released candidate enters repair without losing release evidence", async () => {
+  await withLedger(async (file) => {
+    const released = await createReleasedCandidate(file);
+    const historyBefore = await readFile(`${file}.history.jsonl`, "utf8");
+    const repaired = await repairCandidate(
+      file,
+      repairInput(),
+      timestamps.repaired,
+    );
+
+    assert.equal(repaired.status, "repairing");
+    assert.deepEqual(repaired.owner, released.owner);
+    assert.deepEqual(repaired.source, released.source);
+    assert.equal(repaired.candidateFingerprint, released.candidateFingerprint);
+    assert.deepEqual(repaired.repair.previousPromotion, released.promotion);
+    assert.deepEqual(repaired.repair.compensation, {});
+    assert.equal(repaired.promotion, null);
+    assert.deepEqual(repaired.audit.slice(0, -1), released.audit);
+    assert.deepEqual(repaired.audit.at(-1), {
+      action: "repairing",
+      at: timestamps.repaired,
+      paperclipIssueId: owner.paperclipIssueId,
+    });
+    assert.equal(
+      await readFile(`${file}.history.jsonl`, "utf8"),
+      historyBefore,
+    );
+  });
+});
+
+test("released repair requires app, core, and design compensation before repinning", async () => {
+  await withLedger(async (file) => {
+    await createReleasedCandidate(file);
+    await repairCandidate(file, repairInput(), timestamps.repaired);
+
+    await assert.rejects(pin(file), /record every compensating revert/);
+    await recordCompensatingRevert(file, {
+      paperclipIssueId: owner.paperclipIssueId,
+      repository: "app",
+      mainSha: source.appMainSha,
+    });
+    await assert.rejects(pin(file), /record every compensating revert/);
+    await recordCompensatingRevert(file, {
+      paperclipIssueId: owner.paperclipIssueId,
+      repository: "core",
+      mainSha: source.coreMainSha,
+    });
+    await assert.rejects(pin(file), /record every compensating revert/);
+    await recordCompensatingRevert(file, {
+      paperclipIssueId: owner.paperclipIssueId,
+      repository: "design",
+      mainSha: source.designMainSha,
+    });
+
+    const repinned = await pin(file);
+    assert.equal(repinned.status, "active");
+    assert.equal(repinned.repair, null);
+    assert.equal(repinned.repairHistory.length, 1);
+    assert.equal(repinned.repairHistory[0].compensationComplete, true);
+  });
+});
+
+test("released repair fails closed for a different owner without changing the ledger", async () => {
+  await withLedger(async (file) => {
+    await createReleasedCandidate(file);
+    const before = await readFile(file, "utf8");
+
+    await assert.rejects(
+      repairCandidate(file, repairInput(otherOwner), timestamps.repaired),
+      /cannot mutate it/,
+    );
+    assert.equal(await readFile(file, "utf8"), before);
+  });
+});
+
+test("released repair fails closed for unrecorded or invalid release evidence", async () => {
+  await withLedger(async (file) => {
+    const released = await createReleasedCandidate(file);
+    const invalidCandidates = [
+      { ...released, promotion: null },
+      {
+        ...released,
+        promotion: {
+          ...released.promotion,
+          design: { ...released.promotion.design, mergedMainSha: null },
+        },
+      },
+      { ...released, candidateFingerprint: "0".repeat(64) },
+    ];
+
+    for (const candidate of invalidCandidates) {
+      await writeFile(file, `${JSON.stringify(candidate, null, 2)}\n`);
+      const before = await readFile(file, "utf8");
+      await assert.rejects(
+        repairCandidate(file, repairInput(), timestamps.repaired),
+      );
+      assert.equal(await readFile(file, "utf8"), before);
+    }
+  });
+});
+
+test("repeating the same repair is idempotent for the owner and context", async () => {
+  await withLedger(async (file) => {
+    await createReleasedCandidate(file);
+    const first = await repairCandidate(
+      file,
+      repairInput(),
+      timestamps.repaired,
+    );
+    const persistedAfterFirst = await readFile(file, "utf8");
+    const second = await repairCandidate(
+      file,
+      repairInput(),
+      "2026-08-24T20:08:00.000Z",
+    );
+
+    assert.deepEqual(second, first);
+    assert.equal(await readFile(file, "utf8"), persistedAfterFirst);
+  });
+});
+
+test("preparing, active, and repairing candidates retain their repair behavior", async () => {
+  await withLedger(async (preparingFile) => {
+    await open(preparingFile);
+    const preparingRepair = await repairCandidate(
+      preparingFile,
+      repairInput(),
+      timestamps.repaired,
+    );
+    assert.equal(preparingRepair.status, "repairing");
+    assert.equal(preparingRepair.repair.previousPromotion, null);
+  });
+
+  await withLedger(async (activeFile) => {
+    await open(activeFile);
+    await pin(activeFile);
+    const activeRepair = await repairCandidate(
+      activeFile,
+      repairInput(),
+      timestamps.repaired,
+    );
+    assert.equal(activeRepair.status, "repairing");
+    assert.equal(activeRepair.repair.previousPromotion, null);
+
+    const changed = await repairCandidate(
+      activeFile,
+      { ...repairInput(), reason: "A newer repair reason" },
+      "2026-08-24T20:09:00.000Z",
+    );
+    assert.equal(changed.repair.reason, "A newer repair reason");
+    assert.equal(changed.repair.enteredAt, timestamps.repaired);
+    assert.equal(changed.audit.length, activeRepair.audit.length + 1);
+  });
+});
+
+test("the focused test fixture leaves no live candidate mutation behind", async () => {
+  await withLedger(async (file) => {
+    assert.equal(await readCandidate(file), null);
+  });
+});
