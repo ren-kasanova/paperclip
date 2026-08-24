@@ -34,6 +34,16 @@ const mergedMain = {
   core: "c006a625da3855ad9d1ad8e8a513815a1f3a4938",
   design: "4ab146496e158f9271affe5a5ca21f6bffa0e701",
 };
+const compensatingMain = {
+  app: "a244690f04a470f8e44c71665782be0be19b0c62",
+  core: "d006a625da3855ad9d1ad8e8a513815a1f3a4939",
+  design: "5ab146496e158f9271affe5a5ca21f6bffa0e702",
+};
+const restoredTree = {
+  app: "c8a4de53289b186153ea4e8ec12f3dc407cf7981",
+  core: "1d235486ab9e33b5c702a724c91e5f2934043352",
+  design: "4ec97dccce819c4cd67741cc060f707ce4be5353",
+};
 const timestamps = {
   opened: "2026-08-24T20:00:00.000Z",
   pinned: "2026-08-24T20:01:00.000Z",
@@ -140,6 +150,22 @@ function repairInput(paperclipIssueId = owner.paperclipIssueId) {
   };
 }
 
+function compensationInput(repository, overrides = {}) {
+  const targetMainSha = {
+    app: source.appMainSha,
+    core: source.coreMainSha,
+    design: source.designMainSha,
+  }[repository];
+  return {
+    paperclipIssueId: owner.paperclipIssueId,
+    repository,
+    mainSha: compensatingMain[repository],
+    targetMainSha,
+    treeSha: restoredTree[repository],
+    ...overrides,
+  };
+}
+
 test("owner-matched released candidate enters repair without losing release evidence", async () => {
   await withLedger(async (file) => {
     const released = await createReleasedCandidate(file);
@@ -170,35 +196,142 @@ test("owner-matched released candidate enters repair without losing release evid
   });
 });
 
-test("released repair requires app, core, and design compensation before repinning", async () => {
+test("successful app, core, and design compensation records preserve ancestry evidence", async () => {
   await withLedger(async (file) => {
     await createReleasedCandidate(file);
     await repairCandidate(file, repairInput(), timestamps.repaired);
 
     await assert.rejects(pin(file), /record every compensating revert/);
-    await recordCompensatingRevert(file, {
+    const app = await recordCompensatingRevert(file, compensationInput("app"));
+    assert.deepEqual(app.repair.compensation.app, {
       paperclipIssueId: owner.paperclipIssueId,
       repository: "app",
-      mainSha: source.appMainSha,
+      revertedPromotionMainSha: mergedMain.app,
+      restorationTargetMainSha: source.appMainSha,
+      restoredMainSha: compensatingMain.app,
+      restoredTreeSha: restoredTree.app,
+      recordedAt: app.repair.compensation.app.recordedAt,
     });
     await assert.rejects(pin(file), /record every compensating revert/);
-    await recordCompensatingRevert(file, {
-      paperclipIssueId: owner.paperclipIssueId,
-      repository: "core",
-      mainSha: source.coreMainSha,
-    });
+    await recordCompensatingRevert(file, compensationInput("core"));
     await assert.rejects(pin(file), /record every compensating revert/);
-    await recordCompensatingRevert(file, {
-      paperclipIssueId: owner.paperclipIssueId,
-      repository: "design",
-      mainSha: source.designMainSha,
-    });
+    const design = await recordCompensatingRevert(
+      file,
+      compensationInput("design"),
+    );
+    assert.equal(design.repair.compensationComplete, true);
 
     const repinned = await pin(file);
     assert.equal(repinned.status, "active");
     assert.equal(repinned.repair, null);
     assert.equal(repinned.repairHistory.length, 1);
     assert.equal(repinned.repairHistory[0].compensationComplete, true);
+  });
+});
+
+test("compensation fails closed for the wrong owner or repository", async () => {
+  await withLedger(async (file) => {
+    await createReleasedCandidate(file);
+    await repairCandidate(file, repairInput(), timestamps.repaired);
+    const before = await readFile(file, "utf8");
+
+    await assert.rejects(
+      recordCompensatingRevert(
+        file,
+        compensationInput("app", { paperclipIssueId: otherOwner }),
+      ),
+      /cannot mutate it/,
+    );
+    await assert.rejects(
+      recordCompensatingRevert(file, {
+        ...compensationInput("app"),
+        repository: "wallet",
+      }),
+      /repository must be app, core, or design/,
+    );
+    assert.equal(await readFile(file, "utf8"), before);
+  });
+});
+
+test("compensation rejects the wrong historical restoration target", async () => {
+  await withLedger(async (file) => {
+    await createReleasedCandidate(file);
+    await repairCandidate(file, repairInput(), timestamps.repaired);
+    const before = await readFile(file, "utf8");
+
+    await assert.rejects(
+      recordCompensatingRevert(
+        file,
+        compensationInput("app", { targetMainSha: source.coreMainSha }),
+      ),
+      /does not match pre-candidate main/,
+    );
+    assert.equal(await readFile(file, "utf8"), before);
+  });
+});
+
+test("compensation rejects reuse of the promoted main SHA", async () => {
+  await withLedger(async (file) => {
+    await createReleasedCandidate(file);
+    await repairCandidate(file, repairInput(), timestamps.repaired);
+    const before = await readFile(file, "utf8");
+
+    await assert.rejects(
+      recordCompensatingRevert(
+        file,
+        compensationInput("app", { mainSha: mergedMain.app }),
+      ),
+      /must differ from promoted main/,
+    );
+    assert.equal(await readFile(file, "utf8"), before);
+  });
+});
+
+test("identical compensation retries are idempotent and drift fails closed", async () => {
+  await withLedger(async (file) => {
+    await createReleasedCandidate(file);
+    await repairCandidate(file, repairInput(), timestamps.repaired);
+    const first = await recordCompensatingRevert(
+      file,
+      compensationInput("app"),
+      "2026-08-24T20:08:00.000Z",
+    );
+    const persisted = await readFile(file, "utf8");
+    const repeated = await recordCompensatingRevert(
+      file,
+      compensationInput("app"),
+      "2026-08-24T20:09:00.000Z",
+    );
+    assert.deepEqual(repeated, first);
+    assert.equal(await readFile(file, "utf8"), persisted);
+
+    for (const overrides of [
+      { mainSha: compensatingMain.core },
+      { targetMainSha: source.coreMainSha },
+      { treeSha: restoredTree.core },
+    ]) {
+      await assert.rejects(
+        recordCompensatingRevert(file, compensationInput("app", overrides)),
+        /different app compensation evidence|does not match pre-candidate main/,
+      );
+      assert.equal(await readFile(file, "utf8"), persisted);
+    }
+  });
+});
+
+test("incomplete compensation records cannot satisfy compensationComplete", async () => {
+  await withLedger(async (file) => {
+    await createReleasedCandidate(file);
+    await repairCandidate(file, repairInput(), timestamps.repaired);
+    for (const repository of ["app", "core", "design"]) {
+      await recordCompensatingRevert(file, compensationInput(repository));
+    }
+    const candidate = await readCandidate(file);
+    delete candidate.repair.compensation.design.restoredTreeSha;
+    candidate.repair.compensationComplete = true;
+    await writeFile(file, `${JSON.stringify(candidate, null, 2)}\n`);
+
+    await assert.rejects(pin(file), /record every compensating revert/);
   });
 });
 
