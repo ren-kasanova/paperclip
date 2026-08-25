@@ -250,8 +250,21 @@ function compensationComplete(candidate) {
   const previous = candidate?.repair?.previousPromotion;
   if (!previous) return true;
   return repositoryNames.every((repository) => {
-    if (!previous?.[repository]?.mergedMainSha) return true;
-    return Boolean(candidate?.repair?.compensation?.[repository]?.restoredMainSha);
+    const promotedMainSha = previous?.[repository]?.mergedMainSha;
+    if (!promotedMainSha) return true;
+    const record = candidate?.repair?.compensation?.[repository];
+    const restorationTargetMainSha = candidate?.source?.[repository]?.mainSha;
+    return Boolean(
+      record &&
+        record.paperclipIssueId === candidate?.owner?.paperclipIssueId &&
+        record.repository === repository &&
+        record.revertedPromotionMainSha === promotedMainSha &&
+        record.restorationTargetMainSha === restorationTargetMainSha &&
+        /^[0-9a-f]{40}$/.test(record.restoredMainSha || "") &&
+        record.restoredMainSha !== promotedMainSha &&
+        record.restoredMainSha !== restorationTargetMainSha &&
+        /^[0-9a-f]{40}$/.test(record.restoredTreeSha || ""),
+    );
   });
 }
 
@@ -560,30 +573,55 @@ export async function recordCompensatingRevert(
       throw new Error(`${repository} has no recorded partial promotion to compensate`);
     }
     const restoredMainSha = sha(input.mainSha, `${repository} restored main SHA`);
-    const expectedMainSha = existing.source?.[repository]?.mainSha;
-    if (expectedMainSha && restoredMainSha !== expectedMainSha) {
+    const restorationTargetMainSha = sha(
+      input.targetMainSha,
+      `${repository} restoration target main SHA`,
+    );
+    const restoredTreeSha = sha(input.treeSha, `${repository} restored tree SHA`);
+    const expectedMainSha = sha(
+      existing.source?.[repository]?.mainSha,
+      `${repository} pre-candidate main SHA`,
+    );
+    if (restorationTargetMainSha !== expectedMainSha) {
       throw new Error(
-        `${repository} compensation restored ${restoredMainSha}, expected pre-candidate main ${expectedMainSha}`,
+        `${repository} compensation target ${restorationTargetMainSha} does not match pre-candidate main ${expectedMainSha}`,
+      );
+    }
+    if (restoredMainSha === previousMerge.mergedMainSha) {
+      throw new Error(
+        `${repository} compensation main must differ from promoted main ${previousMerge.mergedMainSha}`,
+      );
+    }
+    if (restoredMainSha === restorationTargetMainSha) {
+      throw new Error(
+        `${repository} compensation main must differ from historical restoration target ${restorationTargetMainSha}`,
       );
     }
     const repair = structuredClone(existing.repair);
     repair.compensation ||= {};
     const current = repair.compensation[repository];
-    if (current?.restoredMainSha && current.restoredMainSha !== restoredMainSha) {
-      throw new Error(
-        `Candidate ${existing.batchId} already recorded ${repository} compensation at ${current.restoredMainSha}`,
-      );
-    }
-    repair.compensation[repository] = {
+    const record = {
+      paperclipIssueId: ownerIssueId,
+      repository,
       revertedPromotionMainSha: previousMerge.mergedMainSha,
+      restorationTargetMainSha,
       restoredMainSha,
+      restoredTreeSha,
       recordedAt: current?.recordedAt || now,
     };
-    repair.compensationComplete = repositoryNames.every((name) =>
-      repair.previousPromotion?.[name]?.mergedMainSha
-        ? Boolean(repair.compensation?.[name]?.restoredMainSha)
-        : true,
-    );
+    if (current) {
+      const matches = Object.entries(record).every(
+        ([key, value]) => current[key] === value,
+      );
+      if (matches && Object.keys(current).length === Object.keys(record).length) {
+        return existing;
+      }
+      throw new Error(
+        `Candidate ${existing.batchId} already recorded different ${repository} compensation evidence`,
+      );
+    }
+    repair.compensation[repository] = record;
+    repair.compensationComplete = compensationComplete({ ...existing, repair });
     return writeCandidate(file, {
       ...existing,
       updatedAt: now,
@@ -591,7 +629,13 @@ export async function recordCompensatingRevert(
       audit: audit(
         existing,
         "compensating-revert-recorded",
-        { paperclipIssueId: ownerIssueId, repository, restoredMainSha },
+        {
+          paperclipIssueId: ownerIssueId,
+          repository,
+          restoredMainSha,
+          restorationTargetMainSha,
+          restoredTreeSha,
+        },
         now,
       ),
     });
@@ -780,6 +824,8 @@ async function runCli() {
       ...ownerInput(args),
       repository: option(args, "repo"),
       mainSha: option(args, "main"),
+      targetMainSha: option(args, "target"),
+      treeSha: option(args, "tree"),
     });
   } else if (command === "adopt") {
     result = await adoptCandidate(file, {
