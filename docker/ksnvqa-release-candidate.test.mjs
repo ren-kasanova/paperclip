@@ -5,6 +5,8 @@ import path from "node:path";
 import test from "node:test";
 
 import {
+  candidateSummary,
+  mergeGate,
   openCandidate,
   pinCandidate,
   readCandidate,
@@ -20,7 +22,7 @@ const owner = {
   paperclipIdentifier: "KSNVQA-856",
 };
 const otherOwner = "9eab523c-d85a-42b3-9d31-89f0f3054cff";
-const tickets = ["KSNV-303", "KSNV-304"];
+const tickets = ["KSNV-303"];
 const source = {
   appDevSha: "24a2c051f5cb1eee1493f24055462ffe88be06f2",
   appMainSha: "43fbc1036be4a14d27f62f0026c51530491a05cb",
@@ -28,6 +30,11 @@ const source = {
   coreMainSha: "001bd2ab2cbd5107d437b4583780622750757f67",
   designDevSha: "bab10f059e2ced4c3faf9b4a499bcf59f5f656d7",
   designMainSha: "13fcb850a9b780b1d2abfe823d7fa100d16e6654",
+};
+const repositorySource = {
+  app: { devSha: source.appDevSha, mainSha: source.appMainSha },
+  core: { devSha: source.coreDevSha, mainSha: source.coreMainSha },
+  design: { devSha: source.designDevSha, mainSha: source.designMainSha },
 };
 const mergedMain = {
   app: "b244690f04a470f8e44c71665782be0be19b0c61",
@@ -71,6 +78,7 @@ async function open(file) {
     {
       ...owner,
       tickets,
+      repositoryNames: Object.keys(repositorySource),
     },
     timestamps.opened,
   );
@@ -82,7 +90,7 @@ async function pin(file) {
     {
       paperclipIssueId: owner.paperclipIssueId,
       tickets,
-      ...source,
+      source: repositorySource,
     },
     timestamps.pinned,
   );
@@ -95,12 +103,11 @@ async function createReleasedCandidate(file) {
     file,
     {
       paperclipIssueId: owner.paperclipIssueId,
-      appPullRequest: "276",
-      appHeadSha: source.appDevSha,
-      corePullRequest: "77",
-      coreHeadSha: source.coreDevSha,
-      designPullRequest: "23",
-      designHeadSha: source.designDevSha,
+      promotion: {
+        app: { pullRequest: "276", headSha: source.appDevSha },
+        core: { pullRequest: "77", headSha: source.coreDevSha },
+        design: { pullRequest: "23", headSha: source.designDevSha },
+      },
     },
     timestamps.staged,
   );
@@ -247,7 +254,7 @@ test("compensation fails closed for the wrong owner or repository", async () => 
         ...compensationInput("app"),
         repository: "wallet",
       }),
-      /repository must be app, core, or design/,
+      /repository must be one of: app, core, design/,
     );
     assert.equal(await readFile(file, "utf8"), before);
   });
@@ -442,6 +449,92 @@ test("preparing, active, and repairing candidates retain their repair behavior",
     assert.equal(changed.repair.reason, "A newer repair reason");
     assert.equal(changed.repair.enteredAt, timestamps.repaired);
     assert.equal(changed.audit.length, activeRepair.audit.length + 1);
+  });
+});
+
+test("backend-only ticket candidate pins Sterling and omits client repositories", async () => {
+  await withLedger(async (file) => {
+    const backendSource = {
+      sterling: {
+        devSha: "1971971971971971971971971971971971971971",
+        mainSha: "1971971971971971971971971971971971971970",
+      },
+    };
+    const opened = await openCandidate(
+      file,
+      {
+        ...owner,
+        tickets: ["KSNV-197"],
+        repositoryNames: ["sterling"],
+      },
+      "2026-09-05T00:00:00.000Z",
+    );
+    assert.notEqual(opened.batchId, "ksnvqa-20260904135425-94afcbc3");
+
+    const pinned = await pinCandidate(file, {
+      paperclipIssueId: owner.paperclipIssueId,
+      tickets: ["KSNV-197"],
+      source: backendSource,
+    });
+    assert.deepEqual(pinned.repositoryNames, ["sterling"]);
+    assert.deepEqual(pinned.source, backendSource);
+    assert.equal(pinned.source.app, undefined);
+    assert.equal(pinned.source.core, undefined);
+    assert.equal(pinned.source.design, undefined);
+
+    await stageCandidatePromotion(file, {
+      paperclipIssueId: owner.paperclipIssueId,
+      promotion: {
+        sterling: { pullRequest: "197", headSha: backendSource.sterling.devSha },
+      },
+    });
+    await recordCandidateMerge(file, {
+      paperclipIssueId: owner.paperclipIssueId,
+      repository: "sterling",
+      headSha: backendSource.sterling.devSha,
+      mainSha: "1971971971971971971971971971971971971972",
+    });
+    const released = await releaseCandidate(file, {
+      paperclipIssueId: owner.paperclipIssueId,
+    });
+    assert.deepEqual(candidateSummary(released).repositories.map(({ repository }) => repository), [
+      "sterling",
+    ]);
+  });
+});
+
+test("candidate scope rejects repository drift and gates only pinned repositories", async () => {
+  await withLedger(async (file) => {
+    const opened = await openCandidate(file, {
+      ...owner,
+      tickets: ["KSNV-197"],
+      repositoryNames: ["sterling"],
+    });
+    assert.equal(mergeGate(opened, "feature", "sterling").allowed, false);
+    assert.equal(mergeGate(opened, "feature", "app").allowed, true);
+    assert.equal(mergeGate(opened, "promotion", "sterling").allowed, true);
+
+    await assert.rejects(
+      pinCandidate(file, {
+        paperclipIssueId: owner.paperclipIssueId,
+        tickets: ["KSNV-197"],
+        source: repositorySource,
+      }),
+      /must exactly match candidate scope: sterling/,
+    );
+  });
+});
+
+test("candidate open rejects ticket batching", async () => {
+  await withLedger(async (file) => {
+    await assert.rejects(
+      openCandidate(file, {
+        ...owner,
+        tickets: ["KSNV-197", "KSNV-303"],
+        repositoryNames: ["sterling"],
+      }),
+      /exactly one KSNV ticket/,
+    );
   });
 });
 
