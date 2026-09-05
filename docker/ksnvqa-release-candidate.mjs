@@ -4,17 +4,20 @@ import { createHash, randomUUID } from "node:crypto";
 import {
   appendFile,
   mkdir,
+  mkdtemp,
   open,
   readFile,
   rename,
+  rm,
   stat,
   unlink,
   writeFile,
 } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
-export const RELEASE_CANDIDATE_SCHEMA = "ksnvqa.release-candidate.v2";
+export const RELEASE_CANDIDATE_SCHEMA = "ksnvqa.release-candidate.v3";
 export const DEFAULT_RELEASE_CANDIDATE_PATH =
   "/Volumes/OdessaExt/Kasanova/KSNVQA_RELEASE_CANDIDATE.lock";
 
@@ -25,8 +28,6 @@ const allowedMergeKinds = new Set([
   "candidate-repair",
   "promotion",
 ]);
-const repositoryNames = ["app", "core", "design"];
-const repositories = new Set(repositoryNames);
 const mutationLockStaleMs = 2 * 60 * 1000;
 const mutationLockWaitMs = 10_000;
 
@@ -131,20 +132,93 @@ export function normalizeTicketIdentifiers(value) {
   return identifiers;
 }
 
-export function candidateFingerprint({
-  appDevSha,
-  coreDevSha,
-  designDevSha,
-  tickets,
-}) {
+function singleTicket(value) {
+  const tickets = normalizeTicketIdentifiers(value);
+  if (tickets.length !== 1) {
+    throw new Error("A release candidate must contain exactly one KSNV ticket");
+  }
+  return tickets;
+}
+
+export function normalizeRepositoryNames(value) {
+  const source = Array.isArray(value) ? value : String(value || "").split(",");
+  const names = [
+    ...new Set(source.map((entry) => String(entry).trim()).filter(Boolean)),
+  ].sort((left, right) => left.localeCompare(right));
+  if (names.length === 0) {
+    throw new Error("At least one touched repository is required");
+  }
+  for (const name of names) {
+    if (!/^[a-z][a-z0-9_-]*$/.test(name)) {
+      throw new Error(`Invalid repository name: ${name}`);
+    }
+  }
+  return names;
+}
+
+function normalizeSource(value) {
+  if (!value || Array.isArray(value) || typeof value !== "object") {
+    throw new Error("Repository source must be a map keyed by repository name");
+  }
+  const source = {};
+  for (const repository of normalizeRepositoryNames(Object.keys(value))) {
+    source[repository] = {
+      devSha: sha(value[repository]?.devSha, `${repository} dev SHA`),
+      mainSha: sha(value[repository]?.mainSha, `${repository} main SHA`),
+    };
+  }
+  return source;
+}
+
+function candidateRepositoryNames(candidate) {
+  return normalizeRepositoryNames(
+    candidate?.repositoryNames || Object.keys(candidate?.source || {}),
+  );
+}
+
+function requireExactRepositoryScope(expected, actual, label) {
+  const expectedNames = normalizeRepositoryNames(expected);
+  const actualNames = normalizeRepositoryNames(actual);
+  if (JSON.stringify(expectedNames) !== JSON.stringify(actualNames)) {
+    throw new Error(
+      `${label} repositories must exactly match candidate scope: ${expectedNames.join(", ")}`,
+    );
+  }
+  return expectedNames;
+}
+
+export function candidateFingerprint({ source, tickets }) {
+  const normalizedSource = normalizeSource(source);
   return createHash("sha256")
     .update(
-      `${sha(appDevSha, "app dev SHA")}:${sha(coreDevSha, "core dev SHA")}:${sha(designDevSha, "design dev SHA")}:${normalizeTicketIdentifiers(tickets).join(",")}`,
+      JSON.stringify({ tickets: singleTicket(tickets), source: normalizedSource }),
     )
     .digest("hex");
 }
 
-export function mergeGate(candidate, mergeKind = "feature") {
+export function candidateSummary(candidate) {
+  if (!candidate) return { status: "none", ticket: null, repositories: [] };
+  const repositoryNames = candidateRepositoryNames(candidate);
+  return {
+    batchId: candidate.batchId,
+    status: candidate.status,
+    ticket: singleTicket(candidate.tickets)[0],
+    repositories: repositoryNames.map((repository) => ({
+      repository,
+      devSha: candidate.source?.[repository]?.devSha || null,
+      mainSha: candidate.source?.[repository]?.mainSha || null,
+      pullRequest: candidate.promotion?.[repository]?.pullRequest || null,
+      promotionState: candidate.promotion?.[repository]?.mergedMainSha
+        ? "merged"
+        : candidate.promotion?.[repository]
+          ? "staged"
+          : "pending",
+    })),
+    candidateFingerprint: candidate.candidateFingerprint || null,
+  };
+}
+
+export function mergeGate(candidate, mergeKind = "feature", repository = null) {
   if (!candidate || !blockingStatuses.has(candidate.status)) {
     return { allowed: true, reason: "No active KSNVQA release-candidate lock." };
   }
@@ -154,11 +228,19 @@ export function mergeGate(candidate, mergeKind = "feature") {
       reason: `Merge kind ${mergeKind} is allowed while candidate ${candidate.batchId} is ${candidate.status}.`,
     };
   }
+  const repositoryNames = candidateRepositoryNames(candidate);
+  if (repository && !repositoryNames.includes(repository)) {
+    return {
+      allowed: true,
+      reason: `Candidate ${candidate.batchId} does not pin repository ${repository}; its dev head is outside this lock.`,
+    };
+  }
   return {
     allowed: false,
     reason:
-      `Candidate ${candidate.batchId} is ${candidate.status}; unrelated merges into dev are paused. ` +
-      "Only main sync, QA-rejection revert, candidate repair, and promotion mutations may proceed.",
+      `Candidate ${candidate.batchId} is ${candidate.status} and pins ${repositoryNames.join(", ")}; ` +
+      `${repository ? `repository ${repository} is locked` : "provide --repo to prove the target repository is outside its scope"}. ` +
+      "Only main sync, QA-rejection revert, candidate repair, and promotion mutations may proceed on pinned repositories.",
   };
 }
 
@@ -210,15 +292,29 @@ export async function openCandidate(file, input, now = new Date().toISOString())
   return withMutationLock(file, async () => {
     const existing = await readCandidate(file);
     if (existing && blockingStatuses.has(existing.status)) {
-      if (existing.owner?.paperclipIssueId === input.paperclipIssueId) return existing;
+      if (existing.owner?.paperclipIssueId === input.paperclipIssueId) {
+        const tickets = singleTicket(input.tickets);
+        const repositoryNames = normalizeRepositoryNames(input.repositoryNames);
+        if (
+          tickets[0] === singleTicket(existing.tickets)[0] &&
+          JSON.stringify(repositoryNames) ===
+            JSON.stringify(candidateRepositoryNames(existing))
+        ) {
+          return existing;
+        }
+        throw new Error(
+          `Candidate ${existing.batchId} is already open with different ticket or repository scope`,
+        );
+      }
       throw new Error(
         `Candidate ${existing.batchId} is already ${existing.status} under ${existing.owner?.paperclipIdentifier || existing.owner?.paperclipIssueId}`,
       );
     }
     if (existing?.status === "released") await appendHistoryOnce(file, existing);
-    const tickets = normalizeTicketIdentifiers(input.tickets);
+    const tickets = singleTicket(input.tickets);
+    const repositoryNames = normalizeRepositoryNames(input.repositoryNames);
     const ownerIssueId = required(input.paperclipIssueId, "Paperclip issue ID");
-    const seed = `${now}:${tickets.join(",")}:${ownerIssueId}`;
+    const seed = `${now}:${tickets[0]}:${repositoryNames.join(",")}:${ownerIssueId}`;
     const batchId =
       `ksnvqa-${now.replace(/[-:.TZ]/g, "").slice(0, 14)}-` +
       createHash("sha256").update(seed).digest("hex").slice(0, 8);
@@ -236,6 +332,7 @@ export async function openCandidate(file, input, now = new Date().toISOString())
         ),
       },
       tickets,
+      repositoryNames,
       source: null,
       candidateFingerprint: null,
       repair: null,
@@ -249,6 +346,7 @@ export async function openCandidate(file, input, now = new Date().toISOString())
 function compensationComplete(candidate) {
   const previous = candidate?.repair?.previousPromotion;
   if (!previous) return true;
+  const repositoryNames = candidateRepositoryNames(candidate);
   return repositoryNames.every((repository) => {
     const promotedMainSha = previous?.[repository]?.mergedMainSha;
     if (!promotedMainSha) return true;
@@ -279,7 +377,8 @@ function requireRecordedReleasedPromotion(candidate) {
     );
   }
 
-  const tickets = normalizeTicketIdentifiers(candidate.tickets);
+  const tickets = singleTicket(candidate.tickets);
+  const repositoryNames = candidateRepositoryNames(candidate);
   const source = {};
   for (const repository of repositoryNames) {
     const pinned = candidate.source?.[repository];
@@ -303,12 +402,7 @@ function requireRecordedReleasedPromotion(candidate) {
     }
   }
 
-  const fingerprint = candidateFingerprint({
-    appDevSha: source.app.devSha,
-    coreDevSha: source.core.devSha,
-    designDevSha: source.design.devSha,
-    tickets,
-  });
+  const fingerprint = candidateFingerprint({ source, tickets });
   if (candidate.candidateFingerprint !== fingerprint) {
     throw new Error(
       `Released candidate ${candidate.batchId} fingerprint does not match its recorded source`,
@@ -329,27 +423,14 @@ export async function pinCandidate(file, input, now = new Date().toISOString()) 
         `Candidate ${existing.batchId} has an unreconciled partial promotion; record every compensating revert before pinning`,
       );
     }
-    const tickets = normalizeTicketIdentifiers(input.tickets || existing.tickets);
-    const source = {
-      app: {
-        devSha: sha(input.appDevSha, "app dev SHA"),
-        mainSha: sha(input.appMainSha, "app main SHA"),
-      },
-      core: {
-        devSha: sha(input.coreDevSha, "core dev SHA"),
-        mainSha: sha(input.coreMainSha, "core main SHA"),
-      },
-      design: {
-        devSha: sha(input.designDevSha, "design dev SHA"),
-        mainSha: sha(input.designMainSha, "design main SHA"),
-      },
-    };
-    const fingerprint = candidateFingerprint({
-      appDevSha: source.app.devSha,
-      coreDevSha: source.core.devSha,
-      designDevSha: source.design.devSha,
-      tickets,
-    });
+    const tickets = singleTicket(input.tickets || existing.tickets);
+    const source = normalizeSource(input.source);
+    const repositoryNames = requireExactRepositoryScope(
+      candidateRepositoryNames(existing),
+      Object.keys(source),
+      "Pinned source",
+    );
+    const fingerprint = candidateFingerprint({ source, tickets });
     if (existing.status === "active" && existing.candidateFingerprint !== fingerprint) {
       throw new Error(
         `Active candidate ${existing.batchId} is immutable; mark it repairing before changing its source SHAs`,
@@ -370,6 +451,7 @@ export async function pinCandidate(file, input, now = new Date().toISOString()) 
       status: "active",
       updatedAt: now,
       tickets,
+      repositoryNames,
       source,
       candidateFingerprint: fingerprint,
       repair: null,
@@ -438,63 +520,53 @@ export async function stageCandidatePromotion(
       throw new Error("Only a pinned active candidate can stage promotion");
     }
     const ownerIssueId = requireOwner(existing, input);
-    const appPullRequest = required(input.appPullRequest, "app pull request");
-    const corePullRequest = required(input.corePullRequest, "core pull request");
-    const designPullRequest = required(
-      input.designPullRequest,
-      "design pull request",
-    );
-    const appHeadSha = sha(input.appHeadSha, "app promotion head SHA");
-    const coreHeadSha = sha(input.coreHeadSha, "core promotion head SHA");
-    const designHeadSha = sha(
-      input.designHeadSha,
-      "design promotion head SHA",
-    );
     if (
-      appHeadSha !== existing.source?.app?.devSha ||
-      coreHeadSha !== existing.source?.core?.devSha ||
-      designHeadSha !== existing.source?.design?.devSha
+      !input.promotion ||
+      Array.isArray(input.promotion) ||
+      typeof input.promotion !== "object"
     ) {
-      throw new Error(
-        `Promotion heads must equal the pinned app/core/design dev SHAs for candidate ${existing.batchId}`,
+      throw new Error("Promotion must be a map keyed by repository name");
+    }
+    const repositoryNames = requireExactRepositoryScope(
+      candidateRepositoryNames(existing),
+      Object.keys(input.promotion),
+      "Promotion",
+    );
+    const promotion = {
+      state: "ready",
+      stagedAt: existing.promotion?.stagedAt || now,
+    };
+    for (const repository of repositoryNames) {
+      const headSha = sha(
+        input.promotion[repository]?.headSha,
+        `${repository} promotion head SHA`,
       );
+      if (headSha !== existing.source?.[repository]?.devSha) {
+        throw new Error(
+          `${repository} promotion head must equal its pinned dev SHA for candidate ${existing.batchId}`,
+        );
+      }
+      promotion[repository] = {
+        pullRequest: required(
+          input.promotion[repository]?.pullRequest,
+          `${repository} pull request`,
+        ),
+        headSha,
+        mergedHeadSha: null,
+        mergedMainSha: null,
+        mergedAt: null,
+      };
     }
     if (
       existing.promotion &&
-      (existing.promotion.app?.pullRequest !== appPullRequest ||
-        existing.promotion.core?.pullRequest !== corePullRequest ||
-        existing.promotion.design?.pullRequest !== designPullRequest ||
-        existing.promotion.app?.headSha !== appHeadSha ||
-        existing.promotion.core?.headSha !== coreHeadSha ||
-        existing.promotion.design?.headSha !== designHeadSha)
+      JSON.stringify(existing.promotion) !== JSON.stringify(promotion)
     ) {
       throw new Error(`Candidate ${existing.batchId} already staged different promotion PRs or heads`);
     }
     return writeCandidate(file, {
       ...existing,
       updatedAt: now,
-      promotion: existing.promotion || {
-        state: "ready",
-        stagedAt: now,
-        app: {
-          pullRequest: appPullRequest,
-          headSha: appHeadSha,
-          mergedMainSha: null,
-          mergedAt: null,
-        },
-        core: {
-          pullRequest: corePullRequest,
-          headSha: coreHeadSha,
-          mergedMainSha: null,
-          mergedAt: null,
-        },
-        design: {
-          pullRequest: designPullRequest,
-          headSha: designHeadSha,
-          mergedMainSha: null,
-          mergedAt: null,
-        },
-      },
+      promotion: existing.promotion || promotion,
       audit: audit(existing, "promotion-staged", { paperclipIssueId: ownerIssueId }, now),
     });
   });
@@ -508,12 +580,13 @@ export async function recordCandidateMerge(
   return withMutationLock(file, async () => {
     const existing = await readCandidate(file);
     if (!existing || existing.status !== "active" || !existing.promotion) {
-      throw new Error("Stage all three promotion PRs before recording a merge");
+      throw new Error("Stage every scoped repository promotion before recording a merge");
     }
     const ownerIssueId = requireOwner(existing, input);
     const repository = required(input.repository, "repository");
-    if (!repositories.has(repository)) {
-      throw new Error("repository must be app, core, or design");
+    const repositoryNames = candidateRepositoryNames(existing);
+    if (!repositoryNames.includes(repository)) {
+      throw new Error(`repository must be one of: ${repositoryNames.join(", ")}`);
     }
     const mergedHeadSha = sha(input.headSha, `${repository} merged PR head SHA`);
     const mergedMainSha = sha(input.mainSha, `${repository} merged main SHA`);
@@ -565,8 +638,9 @@ export async function recordCompensatingRevert(
     }
     const ownerIssueId = requireOwner(existing, input);
     const repository = required(input.repository, "repository");
-    if (!repositories.has(repository)) {
-      throw new Error("repository must be app, core, or design");
+    const repositoryNames = candidateRepositoryNames(existing);
+    if (!repositoryNames.includes(repository)) {
+      throw new Error(`repository must be one of: ${repositoryNames.join(", ")}`);
     }
     const previousMerge = existing.repair.previousPromotion?.[repository];
     if (!previousMerge?.mergedMainSha) {
@@ -687,7 +761,9 @@ export async function cancelCandidate(
     const reason = required(input.reason, "cancellation reason");
     const promotions = [existing.promotion, existing.repair?.previousPromotion];
     const hasRecordedPromotion = promotions.some((promotion) =>
-      repositoryNames.some((repository) => promotion?.[repository]?.mergedMainSha),
+      candidateRepositoryNames(existing).some(
+        (repository) => promotion?.[repository]?.mergedMainSha,
+      ),
     );
     if (hasRecordedPromotion) {
       throw new Error(
@@ -721,18 +797,17 @@ export async function releaseCandidate(
       !existing ||
       existing.status !== "active" ||
       !existing.candidateFingerprint ||
-      existing.promotion?.state !== "merged" ||
-      !existing.promotion.app?.mergedMainSha ||
-      !existing.promotion.core?.mergedMainSha ||
-      !existing.promotion.design?.mergedMainSha
+      existing.promotion?.state !== "merged"
     ) {
       throw new Error(
-        "All three staged promotion PRs must be recorded as merged before release",
+        "Every scoped promotion PR must be recorded as merged before release",
       );
     }
     const ownerIssueId = requireOwner(existing, input);
+    const repositoryNames = candidateRepositoryNames(existing);
     for (const repository of repositoryNames) {
       if (
+        !existing.promotion[repository]?.mergedMainSha ||
         existing.promotion[repository].headSha !==
         existing.source?.[repository]?.devSha
       ) {
@@ -758,11 +833,110 @@ function option(args, name) {
   return index >= 0 ? args[index + 1] : null;
 }
 
+function options(args, name) {
+  const flag = `--${name}`;
+  return args.flatMap((value, index) =>
+    value === flag && args[index + 1] ? [args[index + 1]] : [],
+  );
+}
+
+function parseRepositoryMap(args, flag, valueLabels) {
+  const result = {};
+  for (const specification of options(args, flag)) {
+    const [repository, ...values] = specification
+      .split(",")
+      .map((value) => value.trim());
+    if (
+      !repository ||
+      values.length !== valueLabels.length ||
+      values.some((value) => !value)
+    ) {
+      throw new Error(
+        `--${flag} must use ${["repository", ...valueLabels].join(",")} format`,
+      );
+    }
+    if (result[repository]) {
+      throw new Error(`Duplicate --${flag} repository: ${repository}`);
+    }
+    result[repository] = Object.fromEntries(
+      valueLabels.map((label, index) => [label, values[index]]),
+    );
+  }
+  return result;
+}
+
 function ownerInput(args) {
   return {
     paperclipIssueId:
       option(args, "paperclip-issue-id") || process.env.PAPERCLIP_TASK_ID,
   };
+}
+
+async function runSelfCheck(notBatchId = null) {
+  const directory = await mkdtemp(
+    path.join(os.tmpdir(), "ksnvqa-candidate-self-check-"),
+  );
+  const file = path.join(directory, "candidate.json");
+  const owner = `self-check-${randomUUID()}`;
+  const source = {
+    sterling: {
+      devSha: "1971971971971971971971971971971971971971",
+      mainSha: "1971971971971971971971971971971971971970",
+    },
+  };
+  try {
+    const opened = await openCandidate(file, {
+      paperclipIssueId: owner,
+      paperclipIdentifier: "KSNVQA-SELF-CHECK",
+      tickets: ["KSNV-197"],
+      repositoryNames: ["sterling"],
+    });
+    if (notBatchId && opened.batchId === notBatchId) {
+      throw new Error(`Scratch candidate reused forbidden batch identity ${notBatchId}`);
+    }
+    await pinCandidate(file, {
+      paperclipIssueId: owner,
+      tickets: ["KSNV-197"],
+      source,
+    });
+    await stageCandidatePromotion(file, {
+      paperclipIssueId: owner,
+      promotion: {
+        sterling: {
+          pullRequest: "self-check-pr",
+          headSha: source.sterling.devSha,
+        },
+      },
+    });
+    await recordCandidateMerge(file, {
+      paperclipIssueId: owner,
+      repository: "sterling",
+      headSha: source.sterling.devSha,
+      mainSha: "1971971971971971971971971971971971971972",
+    });
+    const released = await releaseCandidate(file, { paperclipIssueId: owner });
+    const summary = candidateSummary(released);
+    if (
+      summary.status !== "released" ||
+      summary.ticket !== "KSNV-197" ||
+      summary.repositories.length !== 1 ||
+      summary.repositories[0].repository !== "sterling" ||
+      ["app", "core", "design"].some((name) => name in released.source)
+    ) {
+      throw new Error(
+        "Scratch backend-only candidate did not preserve exact repository scope",
+      );
+    }
+    return {
+      schema: RELEASE_CANDIDATE_SCHEMA,
+      pass: true,
+      scratchOnly: true,
+      batchId: released.batchId,
+      summary,
+    };
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 }
 
 async function runCli() {
@@ -772,10 +946,13 @@ async function runCli() {
     DEFAULT_RELEASE_CANDIDATE_PATH;
   let result;
   if (command === "status") {
-    result =
-      (await readCandidate(file)) || {
+    const candidate = await readCandidate(file);
+    result = candidate
+      ? { ...candidate, summary: candidateSummary(candidate) }
+      : {
         schema: RELEASE_CANDIDATE_SCHEMA,
         status: "none",
+        summary: candidateSummary(null),
       };
   } else if (command === "open") {
     result = await openCandidate(file, {
@@ -783,16 +960,12 @@ async function runCli() {
         option(args, "paperclip-issue-id") || process.env.PAPERCLIP_TASK_ID,
       paperclipIdentifier: option(args, "paperclip-identifier"),
       tickets: option(args, "tickets"),
+      repositoryNames: option(args, "repositories"),
     });
   } else if (command === "pin") {
     result = await pinCandidate(file, {
       ...ownerInput(args),
-      appDevSha: option(args, "app-dev"),
-      appMainSha: option(args, "app-main"),
-      coreDevSha: option(args, "core-dev"),
-      coreMainSha: option(args, "core-main"),
-      designDevSha: option(args, "design-dev"),
-      designMainSha: option(args, "design-main"),
+      source: parseRepositoryMap(args, "source", ["devSha", "mainSha"]),
       tickets: option(args, "tickets"),
     });
   } else if (command === "repair") {
@@ -805,12 +978,10 @@ async function runCli() {
   } else if (command === "stage") {
     result = await stageCandidatePromotion(file, {
       ...ownerInput(args),
-      appPullRequest: option(args, "app-pr"),
-      appHeadSha: option(args, "app-head"),
-      corePullRequest: option(args, "core-pr"),
-      coreHeadSha: option(args, "core-head"),
-      designPullRequest: option(args, "design-pr"),
-      designHeadSha: option(args, "design-head"),
+      promotion: parseRepositoryMap(args, "promotion", [
+        "pullRequest",
+        "headSha",
+      ]),
     });
   } else if (command === "record-merge") {
     result = await recordCandidateMerge(file, {
@@ -843,11 +1014,17 @@ async function runCli() {
     result = await releaseCandidate(file, ownerInput(args));
   } else if (command === "gate") {
     const candidate = await readCandidate(file);
-    result = mergeGate(candidate, option(args, "kind") || "feature");
+    result = mergeGate(
+      candidate,
+      option(args, "kind") || "feature",
+      option(args, "repo"),
+    );
     if (!result.allowed) process.exitCode = 3;
+  } else if (command === "self-check") {
+    result = await runSelfCheck(option(args, "not-batch-id"));
   } else {
     throw new Error(
-      "Usage: ksnvqa-release-candidate.mjs status|open|pin|repair|stage|record-merge|record-compensating-revert|adopt|cancel|release|gate",
+      "Usage: ksnvqa-release-candidate.mjs status|open|pin|repair|stage|record-merge|record-compensating-revert|adopt|cancel|release|gate|self-check",
     );
   }
   process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
